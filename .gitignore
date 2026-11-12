@@ -1,0 +1,10 @@
+node_modules
+dist
+*.log
+.env.local
+.env*
+.env
+
+# Local build/upload artifacts
+hostinger-upload.zip
+dist.zip

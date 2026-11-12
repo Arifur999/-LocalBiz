@@ -1,0 +1,504 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { DownloadSimpleIcon as Download, PlusIcon as Plus, FloppyDiskIcon as Save, MagnifyingGlassIcon as Search, TrashIcon as Trash2, PencilSimpleIcon as Pencil, UploadSimpleIcon as Upload } from '@phosphor-icons/react'
+import { supabase } from '../../lib/supabase'
+import PageHeader from '../../components/PageHeader'
+import Modal from '../../components/Modal'
+import { confirmAction } from '../../components/ConfirmDialog'
+import toast from 'react-hot-toast'
+import { useLang } from '../../context/LanguageContext'
+import { addRecycleItem } from '../../lib/recycleBin'
+import { isValidBdPhone, INVALID_PHONE_MESSAGE, DUPLICATE_PHONE_MESSAGE } from '../../lib/phone'
+import { phoneBelongsToAnotherCustomer } from '../../lib/customerPhone'
+import { usePagedList } from '../../lib/usePagedList'
+import { customerCurrentDue } from './customerDashboardData'
+import TableSkeleton from '../../components/TableSkeleton'
+import { getCustomersPage } from '../../services/admin.services'
+import ProgressDialog, { idleProgress, startProgress, type ProgressState } from '../../components/ProgressDialog'
+import { insertInChunks, CsvImportError, partialImportMessage } from '../../lib/csvImport'
+import { NoValue } from '../../components/CellValue'
+
+type CustomerValidationErrors = Partial<Record<'name' | 'phone', string>>
+
+const REQUIRED_FIELD_MESSAGE = 'This field is required!'
+const LINKED_CUSTOMER_DELETE_MESSAGE = 'Cannot Delete Customer: This customer profile contains active transaction or invoice history. You must delete all linked transactions first before removing this customer!'
+
+function parseCsv(text: string) {
+  const rows: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let inQuotes = false
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    const nextChar = text[index + 1]
+
+    if (char === '"' && inQuotes && nextChar === '"') {
+      cell += '"'
+      index += 1
+    } else if (char === '"') {
+      inQuotes = !inQuotes
+    } else if (char === ',' && !inQuotes) {
+      row.push(cell)
+      cell = ''
+    } else if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && nextChar === '\n') index += 1
+      row.push(cell)
+      if (row.some(value => value.trim())) rows.push(row)
+      row = []
+      cell = ''
+    } else {
+      cell += char
+    }
+  }
+
+  row.push(cell)
+  if (row.some(value => value.trim())) rows.push(row)
+  return rows
+}
+
+function normalizeCsvHeader(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\(.*?\)/g, '')
+    .replace(/[^a-z0-9]+/g, '')
+}
+
+function parseAmount(value: string) {
+  const amount = Number(String(value || '').replace(/[^\d.-]/g, ''))
+  return Number.isFinite(amount) ? amount : 0
+}
+
+export default function CustomerList() {
+  const { t, formatCurr } = useLang()
+  // A page at a time, appended as the reader scrolls, so the browser never
+  // holds every customer. Search runs on the server: it has to see the ones
+  // not yet fetched.
+  const paged = usePagedList<any>(
+    useCallback(({ page, limit, search: term }) => getCustomersPage({ page, limit, search: term }), []),
+    { limit: 40 }
+  )
+  const customers = paged.items
+  const setCustomers = paged.setItems
+  const [showModal, setShowModal] = useState(false)
+  const [editItem, setEditItem] = useState<any>(null)
+  const search = paged.search
+  const setSearch = paged.setSearch
+  const [form, setForm] = useState({ name: '', phone: '', email: '', address: '', opening_due: 0 })
+  const [errors, setErrors] = useState<CustomerValidationErrors>({})
+  const [importingCsv, setImportingCsv] = useState(false)
+  const [progress, setProgress] = useState<ProgressState>(idleProgress)
+  const csvInputRef = useRef<HTMLInputElement>(null)
+  // Every customer's sales and collections, so the balance beside their name
+  // is the one the Customer Dashboard and the Due Received modal show. null
+  // until it lands - a row must not read "Tk 0" while the answer is still on
+  // its way, because Tk 0 is a real answer here.
+  const [ledger, setLedger] = useState<{ sales: Record<string, any[]>; payments: Record<string, any[]> } | null>(null)
+
+  useEffect(() => { loadAll() }, [])
+
+  // Not paged with the customers: a balance needs every sale and every
+  // collection belonging to a customer, not the ones on the current page. Two
+  // reads, once, for the whole screen - the same pair the Customer Dashboard
+  // already makes.
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadLedger() {
+      const [salesRes, paymentsRes] = await Promise.all([
+        supabase.from('sales').select('customer_id, net_amount, paid_amount').eq('status', 'completed'),
+        supabase.from('customer_payments').select('customer_id, sale_id, amount, notes'),
+      ])
+      if (cancelled) return
+
+      const sales: Record<string, any[]> = {}
+      ;(salesRes.data || []).forEach((sale: any) => {
+        if (!sale.customer_id) return
+        sales[sale.customer_id] = [...(sales[sale.customer_id] || []), sale]
+      })
+
+      const payments: Record<string, any[]> = {}
+      ;(paymentsRes.data || []).forEach((payment: any) => {
+        if (!payment.customer_id) return
+        payments[payment.customer_id] = [...(payments[payment.customer_id] || []), payment]
+      })
+
+      setLedger({ sales, payments })
+    }
+
+    loadLedger()
+    return () => { cancelled = true }
+  }, [])
+
+  const currentDueFor = (customer: any) =>
+    ledger
+      ? customerCurrentDue(customer.opening_due, ledger.sales[customer.id] || [], ledger.payments[customer.id] || [])
+      : null
+
+  // The rows come from the paged hook; this just re-reads from page one after
+  // a save or delete.
+  async function loadAll() {
+    paged.reload()
+  }
+
+  function openModal(item?: any) {
+    setEditItem(item || null)
+    setForm(item ? {
+      name: item.name || '',
+      phone: item.phone || '',
+      email: item.email || '',
+      address: item.address || '',
+      opening_due: Number(item.opening_due || 0),
+    } : { name: '', phone: '', email: '', address: '', opening_due: 0 })
+    setErrors({})
+    setShowModal(true)
+  }
+
+  const inputClass = (field: keyof CustomerValidationErrors) =>
+    `input ${errors[field] ? 'border-red-500 focus:ring-red-500' : ''}`
+
+  const clearError = (field: keyof CustomerValidationErrors) => {
+    if (!errors[field]) return
+    setErrors(current => {
+      const next = { ...current }
+      delete next[field]
+      return next
+    })
+  }
+
+  async function save(event?: React.FormEvent<HTMLFormElement>) {
+    event?.preventDefault()
+
+    const nextErrors: CustomerValidationErrors = {}
+    const payload = {
+      ...form,
+      name: form.name.trim(),
+      phone: form.phone.trim(),
+      email: form.email.trim(),
+      address: form.address.trim(),
+      opening_due: Number(form.opening_due || 0),
+    }
+
+    if (!payload.name) nextErrors.name = REQUIRED_FIELD_MESSAGE
+    if (!payload.phone) nextErrors.phone = REQUIRED_FIELD_MESSAGE
+    else if ((!editItem || payload.phone !== String(editItem.phone || '').trim()) && !isValidBdPhone(payload.phone)) nextErrors.phone = INVALID_PHONE_MESSAGE
+
+    // Asked only once the number itself is valid, so a typo does not cost a
+    // round trip. The customer being edited may keep their own number.
+    if (!nextErrors.phone && await phoneBelongsToAnotherCustomer(payload.phone, editItem?.id)) {
+      nextErrors.phone = DUPLICATE_PHONE_MESSAGE
+    }
+
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length > 0) return
+
+    if (editItem) await supabase.from('customers').update(payload).eq('id', editItem.id)
+    else await supabase.from('customers').insert(payload)
+    toast.success(t('common_saved'))
+    setShowModal(false)
+    loadAll()
+  }
+
+  async function importCustomersFromCsv(file: File) {
+    setImportingCsv(true)
+    setProgress(startProgress('Importing customers', file.name, 'Reading the file'))
+    // Read back in the catch block below. State cannot be used there: this
+    // closure captured it from the render that started the import, so it would
+    // still say zero.
+    let plannedRows = 0
+
+    try {
+      const text = await file.text()
+      setProgress(current => ({ ...current, step: 'Checking the rows' }))
+      const rows = parseCsv(text)
+      if (rows.length < 2) {
+        toast.error('CSV file has no customer rows')
+        return
+      }
+
+      const headers = rows[0].map(normalizeCsvHeader)
+      const indexOf = (...names: string[]) => names.map(normalizeCsvHeader).map(name => headers.indexOf(name)).find(index => index >= 0) ?? -1
+      const nameIndex = indexOf('name')
+      const phoneIndex = indexOf('phone')
+      const emailIndex = indexOf('email')
+      const addressIndex = indexOf('address')
+      const openingDueIndex = indexOf('opening due', 'openingdue', 'opening due taka')
+
+      if (nameIndex < 0 || phoneIndex < 0) {
+        toast.error('CSV must include Name and Phone columns')
+        return
+      }
+
+      let skipped = 0
+      const payload = rows.slice(1).map(row => ({
+        name: String(row[nameIndex] || '').trim(),
+        phone: String(row[phoneIndex] || '').trim(),
+        email: emailIndex >= 0 ? String(row[emailIndex] || '').trim() : '',
+        address: addressIndex >= 0 ? String(row[addressIndex] || '').trim() : '',
+        opening_due: openingDueIndex >= 0 ? parseAmount(row[openingDueIndex]) : 0,
+      })).filter(customer => {
+        const valid = Boolean(customer.name && customer.phone)
+        if (!valid) skipped += 1
+        return valid
+      })
+
+      if (payload.length === 0) {
+        toast.error('No valid customers found. Name and Phone are required.')
+        return
+      }
+
+      plannedRows = payload.length
+      setProgress(current => ({ ...current, step: 'Saving customers', processed: 0, total: payload.length }))
+      await insertInChunks(
+        payload,
+        chunk => supabase.from('customers').insert(chunk),
+        saved => setProgress(current => ({ ...current, processed: saved })),
+      )
+
+      // Hold on "Finished" for a moment so the dialog is not simply gone -
+      // there is otherwise no sign the import ran at all.
+      setProgress(current => ({ ...current, done: true }))
+      await new Promise(resolve => setTimeout(resolve, 700))
+
+      toast.success(`Imported ${payload.length} customer${payload.length === 1 ? '' : 's'}${skipped ? `, skipped ${skipped}` : ''}`)
+      loadAll()
+    } catch (error: any) {
+      if (error instanceof CsvImportError) {
+        toast.error(partialImportMessage(error, plannedRows))
+        // Some rows did land, so the list on screen is out of date either way.
+        loadAll()
+      } else {
+        toast.error(error.message || 'Failed to import customers')
+      }
+    } finally {
+      setImportingCsv(false)
+      setProgress(idleProgress)
+      if (csvInputRef.current) csvInputRef.current.value = ''
+    }
+  }
+
+  async function deleteCustomer(id: string, name: string) {
+    if (!(await confirmAction({
+      title: 'Delete Customer?',
+      message: 'Are you sure you want to permanently delete this customer profile? This will remove the profile record only if no sales or transaction histories are attached.',
+      confirmText: 'Yes, Delete',
+      cancelText: 'No, Cancel',
+    }))) return
+
+    try {
+      const [salesRes, paymentRes, splitPaymentRes] = await Promise.all([
+        supabase
+          .from('sales')
+          .select('id', { count: 'exact', head: true })
+          .eq('customer_id', id),
+        supabase
+          .from('customer_payments')
+          .select('id', { count: 'exact', head: true })
+          .eq('customer_id', id),
+        supabase
+          .from('sale_payments')
+          .select('id', { count: 'exact', head: true })
+          .eq('customer_id', id),
+      ])
+
+      const countError = salesRes.error || paymentRes.error || splitPaymentRes.error
+      if (countError) throw countError
+
+      if (Number(salesRes.count || 0) > 0 || Number(paymentRes.count || 0) > 0 || Number(splitPaymentRes.count || 0) > 0) {
+        toast.error(LINKED_CUSTOMER_DELETE_MESSAGE)
+        return
+      }
+
+      const customer = customers.find(c => c.id === id)
+      if (customer) {
+        addRecycleItem({
+          type: 'customers',
+          table: 'customers',
+          title: customer.name || '-',
+          subtitle: customer.phone || customer.email || '-',
+          amount: Number(customer.opening_due || 0),
+          data: customer,
+        })
+      }
+      const { error } = await supabase.from('customers').delete().eq('id', id)
+      if (error) throw error
+      toast.success('Customer profile deleted successfully.')
+      loadAll()
+    } catch (error: any) {
+      const message = String(error?.message || '')
+      if (message.includes('active transaction or invoice history') || message.includes('foreign key')) {
+        toast.error(LINKED_CUSTOMER_DELETE_MESSAGE)
+        return
+      }
+      toast.error(error.message || 'Failed to delete customer')
+    }
+  }
+
+  // Downloads a ready-to-fill template that matches the Upload CSV parser:
+  // Name + Phone are required, Email / Address / Opening Due are optional.
+  function downloadSampleCsv() {
+    const sample = [
+      'Name,Phone,Email,Address,Opening Due',
+      'Md Rahim,01700000000,rahim@example.com,Sonaimuri Noakhali,0',
+      'Karim Traders,01811111111,,Feni Bazar,1500',
+      'Walking Customer,01922222222,,,0',
+    ].join('\r\n')
+    const blob = new Blob(['﻿' + sample], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'customer-sample.csv'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  // The server applied the search already - filtering again here would only
+  // let the two rules drift apart.
+  const filtered = customers
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden p-6">
+      <PageHeader
+        title={t('customers_listTitle')}
+        subtitle={t('customers_listTitle')}
+        actions={
+          <>
+            <input
+              ref={csvInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={event => {
+                const file = event.target.files?.[0]
+                if (file) importCustomersFromCsv(file)
+              }}
+            />
+            <button type="button" onClick={downloadSampleCsv} className="btn-secondary bg-white" title="Download a sample CSV template">
+              <Download size={16} /> Sample CSV
+            </button>
+            <button type="button" onClick={() => csvInputRef.current?.click()} disabled={importingCsv} className="btn-secondary bg-white disabled:opacity-60 disabled:cursor-not-allowed">
+              <Upload size={16} /> {importingCsv ? 'Uploading...' : 'Upload CSV'}
+            </button>
+            <button onClick={() => openModal()} className="btn-primary"><Plus size={16} /> {t('customers_new')}</button>
+          </>
+        }
+      />
+
+      {/* The two summary cards are gone. The count is already stated under the
+          table ("40 of 40 loaded") and the Opening Due total has its own column
+          on every row - both were repeating what the list below says. */}
+      <div className="mb-4 flex flex-shrink-0 gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder={t('customers_searchPlaceholder')} className="input pl-9" />
+        </div>
+      </div>
+
+      <div className="card min-h-0 flex-1 overflow-auto p-0">
+        <table className="w-full text-sm">
+          <thead className="table-header">
+            <tr>
+              <th className="text-left py-2 px-4 w-12">#</th>
+              <th className="text-left py-2 px-4">{t('customers_colName')}</th>
+              <th className="text-left py-2 px-4">{t('customers_colPhone')}</th>
+              <th className="text-left py-2 px-4">{t('customers_colAddress')}</th>
+              <th className="text-right py-2 px-4">Opening Due</th>
+              <th className="text-right py-2 px-4">Current Due</th>
+              <th className="text-center py-2 px-4 w-24">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((c, idx) => (
+              <tr key={c.id} className="table-row">
+                <td className="py-2.5 px-4 text-slate-500 text-sm font-medium">{idx + 1}</td>
+                <td className="py-2.5 px-4 font-medium">{c.name}</td>
+                <td className="py-2.5 px-4 text-slate-500">{c.phone || <NoValue />}</td>
+                <td className="py-2.5 px-4 text-slate-500">{c.address || <NoValue />}</td>
+                {/* What they started with. It is a fixed historical figure and
+                    never moves, however much they pay - which is why the
+                    balance sits beside it rather than instead of it. */}
+                <td className="py-2.5 px-4 text-right font-medium">
+                  <span className={c.opening_due > 0 ? 'text-brand-red' : 'text-slate-500'}>{formatCurr(c.opening_due || 0)}</span>
+                </td>
+                {/* What they owe now. Negative is money owed back to them. */}
+                <td className="py-2.5 px-4 text-right font-semibold">
+                  {(() => {
+                    const due = currentDueFor(c)
+                    if (due === null) return <span className="text-slate-300">…</span>
+                    return (
+                      <span className={due > 0 ? 'text-brand-red' : due < 0 ? 'text-brand-green' : 'text-slate-500'}>
+                        {formatCurr(due)}
+                      </span>
+                    )
+                  })()}
+                </td>
+                <td className="py-2.5 px-4 text-center">
+                  <div className="flex gap-2 justify-center">
+                    <button onClick={() => openModal(c)} className="text-slate-400 hover:text-slate-700 transition-colors"><Pencil size={16} /></button>
+                    <button onClick={() => deleteCustomer(c.id, c.name)} className="text-slate-400 hover:text-red-500 transition-colors"><Trash2 size={16} /></button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {paged.loading && <TableSkeleton rows={8} cols={7} />}
+            {!paged.loading && filtered.length === 0 && <tr><td colSpan={7} className="text-center py-8 text-slate-400">{t('customers_noCustomers')}</td></tr>}
+            {paged.hasMore && !paged.loading && (
+              <tr ref={paged.sentinelRef as unknown as React.Ref<HTMLTableRowElement>}>
+                <td colSpan={7} className="py-4 text-center text-sm text-slate-400">
+                  {paged.loadingMore
+                    ? `Loading more… ${customers.length.toLocaleString()} of ${paged.total.toLocaleString()}`
+                    : `${customers.length.toLocaleString()} of ${paged.total.toLocaleString()} loaded`}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <Modal isOpen={showModal} onClose={() => setShowModal(false)} title={editItem ? t('customers_edit') : t('customers_new')}>
+        <form className="space-y-3" onSubmit={save} noValidate>
+          <div>
+            <label className="label" htmlFor="customer-name">{t('customers_nameStar')}</label>
+            <input
+              id="customer-name"
+              className={inputClass('name')}
+              value={form.name}
+              required
+              aria-invalid={!!errors.name}
+              onChange={e => {
+                clearError('name')
+                setForm({ ...form, name: e.target.value })
+              }}
+            />
+            {errors.name && <p className="mt-1 text-xs font-medium text-red-600">{errors.name}</p>}
+          </div>
+          <div>
+            <label className="label" htmlFor="customer-phone">{t('customers_phoneStar')}</label>
+            <input
+              id="customer-phone"
+              className={inputClass('phone')}
+              value={form.phone}
+              required
+              aria-invalid={!!errors.phone}
+              onChange={e => {
+                clearError('phone')
+                setForm({ ...form, phone: e.target.value })
+              }}
+            />
+            {errors.phone && <p className="mt-1 text-xs font-medium text-red-600">{errors.phone}</p>}
+          </div>
+          <div><label className="label" htmlFor="customer-list-f1">{t('common_email')}</label><input id="customer-list-f1" className="input" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} /></div>
+          <div><label className="label" htmlFor="customer-list-f2">{t('common_address')}</label><textarea id="customer-list-f2" className="input" rows={2} value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></div>
+          <div><label className="label" htmlFor="customer-list-f3">{t('customers_openingDue')}</label><input id="customer-list-f3" type="number" min="0" className="input" value={form.opening_due || ''} onChange={e => setForm({ ...form, opening_due: Number(e.target.value) })} /></div>
+          <div className="flex gap-2 pt-2">
+            <button type="submit" className="btn-primary flex-1 justify-center"><Save size={16} /> {t('common_save')}</button>
+            <button type="button" onClick={() => setShowModal(false)} className="btn-secondary flex-1 justify-center">{t('common_cancel')}</button>
+          </div>
+        </form>
+      </Modal>
+
+      <ProgressDialog state={progress} />
+    </div>
+  )
+}

@@ -1,0 +1,40 @@
+name: CI
+
+# Quality gate: runs on every push to main and on every pull request into
+# main. A red check here means don't merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Errors fail the build; the ~80 pre-existing warnings (unused vars,
+      # react-hooks/exhaustive-deps) are a separate cleanup task, not part of
+      # this deployment setup, so this intentionally omits --max-warnings 0
+      # (unlike the package.json "lint" script, which stays strict for
+      # anyone running it locally).
+      - name: Lint (errors only)
+        run: npx eslint . --ext ts,tsx --report-unused-disable-directives
+
+      # queryEngine.test.ts pins down what a query means in this app - strict
+      # equality, ilike as a plain contains, null matching undefined. Every
+      # figure on every page comes out of those rules, so a change to them has
+      # to fail here rather than reach the server.
+      - name: Tests
+        run: npm test
+
+      - name: Type check + build
+        run: npm run build

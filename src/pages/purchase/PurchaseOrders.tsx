@@ -1,0 +1,1744 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { PlusIcon as Plus, FloppyDiskIcon as Save, CaretDownIcon as ChevronDown, CaretUpIcon as ChevronUp, TruckIcon as Truck, PencilSimpleIcon as Edit2, TrashIcon as Trash2, MagnifyingGlassIcon as Search, SlidersIcon as SlidersHorizontal, InfoIcon as Info, PackageIcon as Package, ShoppingCartSimpleIcon as ShoppingCart } from '@phosphor-icons/react'
+import { supabase } from '../../lib/supabase'
+import { actualDp, purchaseDeposit, purchaseItemDeposit, spAmountFor, supplierBalance } from '../../lib/purchaseAmounts'
+import { formatDate, generateSINo, roundTaka, todayISO } from '../../lib/utils'
+import PageHeader from '../../components/PageHeader'
+import TableScroller from '../../components/TableScroller'
+import Modal from '../../components/Modal'
+import { confirmAction } from '../../components/ConfirmDialog'
+import toast from 'react-hot-toast'
+import { useAuth } from '../../context/AuthContext'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { deleteDraft, getDraft, saveDraft as saveDraftRequest, updateDraft } from '../../services/draft.services'
+import { PURCHASE_DRAFT_VERSION, STALE_DRAFT_MESSAGE, isPurchaseDraftPayload } from '../../lib/draftPayload'
+import { ApiError } from '../../lib/httpClient'
+import { useLang } from '../../context/LanguageContext'
+import { addRecycleItem } from '../../lib/recycleBin'
+import { createPurchase as createPurchaseRequest, deletePurchaseReceive, receiveAllPurchaseItems, receivePurchaseItem, updatePurchaseReceive } from '../../services/purchase.services'
+import { createOpeningStockBatch, createReceiveStockBatch } from '../../lib/fifoInventory'
+import { NoValue } from '../../components/CellValue'
+
+type OrderStatus = 'pending' | 'partial' | 'received'
+
+// The three order statuses, in the colours the legend at the top of the page
+// uses, so the dropdown reads the same way as the badges in the list below.
+//
+// `partial` cannot be chosen when creating an order: it means "some of these
+// arrived", and how many of each is exactly what this form has no field for.
+// That is recorded on the Product Received page, and the status then follows
+// from the quantities actually received.
+const ORDER_STATUS_META: Record<OrderStatus, { label: string; hex: string; textClass: string; dot: string }> = {
+  pending: { label: 'Pending Receive', hex: '#d97706', textClass: 'text-brand-orange', dot: '●' },
+  partial: { label: 'Partially Received', hex: '#475569', textClass: 'text-slate-600', dot: '●' },
+  received: { label: 'Received', hex: '#1D9E75', textClass: 'text-brand-green', dot: '●' },
+}
+
+const ORDER_STATUS_OPTIONS = (Object.keys(ORDER_STATUS_META) as OrderStatus[]).map(value => ({
+  value,
+  ...ORDER_STATUS_META[value],
+  disabledOnCreate: value === 'partial',
+}))
+
+interface PurchaseItem {
+  product_id: string
+  product_code: string
+  product_name: string
+  dp_price: number
+  discount_pct: number
+  actual_dp: number
+  qty: number
+  total_amount: number
+  sp_amount: number
+  deposit_amount: number
+  received_qty: number
+}
+
+// SP is the incentive the supplier gives back on a purchase - the reports read
+// it as exactly that (see YearlyReport: incentive = sp_amount, deposit =
+// total_amount - sp_amount). The owner sets one percentage for the whole order
+// instead of typing a figure per row, so the amount is always derived here and
+// never typed. Every place that changes a row's total has to run through this,
+// or the percentage and the figure beside it would drift apart.
+function applySpPercent(item: PurchaseItem, percent: number): PurchaseItem {
+  // Whole taka: a percentage of a total almost never divides evenly (5% of
+  // 1,050 is 52.50), and this figure is both shown to the operator and saved,
+  // so the paisa used to reach the supplier ledger and every profit report.
+  const spAmount = spAmountFor(item.total_amount, percent)
+  return { ...item, sp_amount: spAmount, deposit_amount: purchaseDeposit(item.total_amount, spAmount) }
+}
+
+const productListCacheKey = 'product_list_cache_v1'
+
+function readProductListCache() {
+  if (typeof window === 'undefined') return []
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(productListCacheKey) || '[]')
+    if (!Array.isArray(cached)) return []
+    return cached
+      .map((row: any) => ({
+        id: row.id,
+        product_code: row.product_code || '',
+        name: row.name || '',
+        cost_price: Number(row.cost_price || 0),
+        selling_price: Number(row.selling_price || 0),
+        image_url: row.image_url || null,
+        discount: Number(row.dp_discount ?? row.discount ?? 0),
+        opening_qty: Number(row.opening_qty || 0),
+      }))
+      .filter((row: any) => row.id && row.product_code && row.name)
+  } catch {
+    return []
+  }
+}
+
+function productsForPicker(databaseProducts: any[] | null | undefined) {
+  const rows = databaseProducts || []
+  if (rows.length > 0) return rows
+  return readProductListCache()
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
+function dbProductId(value: string) {
+  return isUuid(value) ? value : null
+}
+
+export default function PlaceOrder() {
+  const { t, formatCurr } = useLang()
+  const [purchases, setPurchases] = useState<any[]>([])
+  const [suppliers, setSuppliers] = useState<any[]>([])
+  const [products, setProducts] = useState<any[]>([])
+  const [accounts, setAccounts] = useState<any[]>([])
+  const [inventoryByProduct, setInventoryByProduct] = useState<Record<string, number>>({})
+  const [supplierBalanceById, setSupplierBalanceById] = useState<Record<string, number>>({})
+  const [productSearch, setProductSearch] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('')
+  const [showCategoryFilter, setShowCategoryFilter] = useState(false)
+  const [showModal, setShowModal] = useState(false)
+  const [showQuickAddProduct, setShowQuickAddProduct] = useState(false)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [showReceiveModal, setShowReceiveModal] = useState(false)
+  const [receiveItem, setReceiveItem] = useState<any>(null)
+  const [editingReceiveId, setEditingReceiveId] = useState<string | null>(null)
+  const [editReceiveQty, setEditReceiveQty] = useState(0)
+  const [showEditReceiveModal, setShowEditReceiveModal] = useState(false)
+  const [editingPOId, setEditingPOId] = useState<string | null>(null)
+  const [showEditPOModal, setShowEditPOModal] = useState(false)
+  const [editPOForm, setEditPOForm] = useState({ si_no: '', date: '', supplier_id: '' })
+  // Set while this form is standing in for a parked draft, so saving again
+  // overwrites it instead of parking a second copy, and publishing knows which
+  // row to clear.
+  const [draftId, setDraftId] = useState<string | null>(null)
+  const [savingDraft, setSavingDraft] = useState(false)
+  const { user, touchOwnerActivity } = useAuth()
+
+  // shipping_status is typed as the union, not inferred from the initial value:
+  // `'pending' as const` narrowed the whole field to that one literal, so the
+  // dropdown could never actually put anything else in here.
+  const [form, setForm] = useState<{
+    si_no: string; supplier_id: string; supplier_name: string
+    date: string; account_id: string; notes: string; shipping_status: OrderStatus
+  }>({
+    si_no: generateSINo(), supplier_id: '', supplier_name: '',
+    date: todayISO(),
+    account_id: '', notes: '', shipping_status: 'pending',
+  })
+  const [items, setItems] = useState<PurchaseItem[]>([{
+    product_id: '', product_code: '', product_name: '',
+    dp_price: 0, discount_pct: 0, actual_dp: 0, qty: 1, total_amount: 0, sp_amount: 0, deposit_amount: 0, received_qty: 0
+  }])
+  const [paidAmount, setPaidAmount] = useState(0)
+  // One incentive percentage for the whole order; every row's SP amount is
+  // worked out from it.
+  const [spPercent, setSpPercent] = useState(0)
+  const [quickProductForm, setQuickProductForm] = useState({
+    product_code: '',
+    name: '',
+    image_url: '',
+    supplier_id: '',
+    cost_price: 0,
+    discount: 0,
+    selling_price: 0,
+    opening_qty: 0,
+    size: '',
+    weight: '',
+  })
+
+  const [receiveForm, setReceiveForm] = useState({
+    receive_date: todayISO(),
+    receiver_name: '', received_qty: 0, condition: 'good', notes: ''
+  })
+
+  /**
+   * The first loadAll, kept so openDraft can wait for its suppliers.
+   *
+   * Both of this component's mount effects fire together, and openDraft asked
+   * the `suppliers` STATE whether the draft's supplier still existed. On a
+   * fresh page load that state is still the empty array the component started
+   * with, so the answer was always "gone" - and every reopened draft came back
+   * with its supplier cleared, which is what was reported.
+   *
+   * The refreshes further down keep calling loadAll() directly; only this one
+   * is held, because only this one is raced.
+   */
+  const firstLoad = useRef<Promise<any[]> | null>(null)
+  useEffect(() => { firstLoad.current = loadAll() }, [])
+
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+
+  // Opening a draft is a one-shot: the id comes in on the query string and is
+  // stripped straight away. Leaving it there would reopen the draft on every
+  // refresh - including after it had been published and deleted, which would
+  // greet a successful order with "Draft not found".
+  useEffect(() => {
+    const id = searchParams.get('draft')
+    if (!id) return
+    navigate('/purchase/orders', { replace: true })
+    void openDraft(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
+  async function openDraft(id: string) {
+    try {
+      // Both requests at once, but the supplier check below waits for the
+      // list: asking a `suppliers` state that has not arrived yet reported
+      // every supplier as deleted.
+      const [draft, supplierList] = await Promise.all([
+        getDraft(id),
+        // null when the list could not be fetched at all, which is different
+        // from "fetched, and the supplier is not in it" - see below.
+        (firstLoad.current ?? loadAll()).catch(() => null),
+      ])
+      const payload = draft.data
+      if (!isPurchaseDraftPayload(payload)) {
+        toast.error(STALE_DRAFT_MESSAGE)
+        return
+      }
+
+      // A draft can outlive what it points at - a supplier removed, a product
+      // deleted - and the server would refuse the publish with "Supplier not
+      // found" only after the whole form had been checked over again. Drop the
+      // dead reference now and say so.
+      //
+      // Only on a positive answer. An absent list means we do not know, and
+      // clearing the supplier on a guess is exactly what was going wrong.
+      const supplierGone = Boolean(
+        supplierList
+        && payload.form.supplier_id
+        && !supplierList.some(supplier => supplier.id === payload.form.supplier_id)
+      )
+
+      setForm({
+        ...payload.form,
+        supplier_id: supplierGone ? '' : payload.form.supplier_id,
+        shipping_status: (payload.form.shipping_status || 'pending') as OrderStatus,
+      })
+      setItems(payload.items as unknown as PurchaseItem[])
+      setSpPercent(Number(payload.spPercent || 0))
+      setDraftId(draft.id)
+
+      toast.success(supplierGone
+        ? 'Draft loaded. Its supplier no longer exists - please pick another.'
+        : 'Draft loaded')
+    } catch (error: any) {
+      toast.error(error?.message || 'Could not open that draft')
+    }
+  }
+
+  /**
+   * Park the order as it stands.
+   *
+   * No validation, deliberately: a half-finished order is exactly what this
+   * button is for, and the checks save() runs would refuse it.
+   */
+  async function saveAsDraft() {
+    if (savingDraft) return
+
+    // The one thing a draft cannot do without. Everything else on this form can
+    // be filled in later, but a purchase order with no supplier is not an order
+    // anybody could pick up and finish - and the draft list is indexed by who
+    // it is for.
+    if (!form.supplier_id) {
+      toast.error('Choose a supplier before saving this as a draft')
+      return
+    }
+
+    const supplier = suppliers.find(item => item.id === form.supplier_id)
+    const body = {
+      kind: 'purchase_order' as const,
+      title: supplier?.name || supplier?.company_name || '',
+      subtitle: form.si_no || '',
+      amount: totalAmount,
+      payload_version: PURCHASE_DRAFT_VERSION,
+      data: { v: PURCHASE_DRAFT_VERSION, form, items, spPercent } as unknown as Record<string, unknown>,
+    }
+
+    try {
+      setSavingDraft(true)
+      if (draftId) {
+        await updateDraft(draftId, body)
+      } else {
+        const created = await saveDraftRequest(body)
+        setDraftId(created.id)
+      }
+      // Twenty minutes building a draft is not idle time.
+      void touchOwnerActivity(true)
+      toast.success('Saved to Draft Purchase Order')
+    } catch (error: any) {
+      toast.error(error?.message || 'Could not save this draft')
+    } finally {
+      setSavingDraft(false)
+    }
+  }
+
+  /**
+   * The order is saved; the draft that became it is no longer wanted.
+   *
+   * Never rolls the order back and never reports the save as failed. A 404
+   * means somebody else already cleared it, which is the outcome anyway.
+   * Anything else leaves a draft that outlived its order - untidy, and the
+   * draft page has a Delete button - whereas saying the save failed would have
+   * the operator enter the same order twice.
+   */
+  async function clearPublishedDraft() {
+    if (!draftId) return
+    try {
+      await deleteDraft(draftId)
+    } catch (error: any) {
+      if (!(error instanceof ApiError && error.status === 404)) {
+        toast('Order saved. The draft could not be removed - delete it from Draft Purchase Order.')
+      }
+    }
+    setDraftId(null)
+  }
+
+  async function loadAll(): Promise<any[]> {
+    const [poRes, supRes, proRes, accRes, invRes, balancePoRes, payRes] = await Promise.all([
+      supabase.from('purchases').select('*, purchase_items(*, purchase_receives(*))').in('shipping_status', ['pending', 'partial']).order('date', { ascending: false }),
+      supabase.from('suppliers').select('id, name, company_name, phone, opening_due, due_type').eq('is_active', true),
+      supabase.from('products').select('id, product_code, name, cost_price, selling_price, image_url, discount, dp_discount').eq('is_active', true),
+      supabase.from('accounts').select('*').eq('is_active', true).order('sort_order'),
+      supabase.from('inventory').select('product_id, available_qty'),
+      supabase.from('purchases').select('supplier_id, paid_amount, purchase_items(*, purchase_receives(received_qty))'),
+      supabase.from('supplier_payments').select('supplier_id, amount'),
+    ])
+    const pickerProducts = productsForPicker(proRes.data)
+    setPurchases(poRes.data || [])
+    setSuppliers(supRes.data || [])
+    setProducts(pickerProducts)
+    setAccounts(accRes.data || [])
+    const stockMap: Record<string, number> = {}
+    ;(invRes.data || []).forEach((row: any) => {
+      stockMap[row.product_id] = (stockMap[row.product_id] || 0) + Number(row.available_qty || 0)
+    })
+    pickerProducts.forEach((product: any) => {
+      if (stockMap[product.id] == null) stockMap[product.id] = Number(product.opening_qty || 0)
+    })
+    setInventoryByProduct(stockMap)
+
+    const allPurchases = balancePoRes.data || []
+    const payments = payRes.data || []
+    const balanceMap: Record<string, number> = {}
+    ;(supRes.data || []).forEach((sup: any) => {
+      const supplierPurchases = allPurchases.filter((purchase: any) => purchase.supplier_id === sup.id)
+      const supplierItems = supplierPurchases.flatMap((purchase: any) => purchase.purchase_items || [])
+      // The shared rule, same as the Supplier Dashboard and the report Due
+      // columns. This used to bill on what had been RECEIVED and never deduct
+      // the SP incentive, so it was the one screen out of three that disagreed -
+      // and it is the figure on screen when the owner decides how much to pay.
+      balanceMap[sup.id] = supplierBalance({
+        supplier: sup,
+        items: supplierItems,
+        payments: payments.filter((payment: any) => payment.supplier_id === sup.id),
+        purchases: supplierPurchases,
+      })
+    })
+    setSupplierBalanceById(balanceMap)
+
+    // For openDraft, which needs the list itself rather than the state that
+    // will hold it a render later.
+    return (supRes.data || [])
+  }
+
+  function resetQuickProductForm() {
+    setQuickProductForm({ product_code: '', name: '', image_url: '', supplier_id: '', cost_price: 0, discount: 0, selling_price: 0, opening_qty: 0, size: '', weight: '' })
+  }
+
+  function removeMissingProductColumn(payload: any, error: any) {
+    const message = String(error?.message || '')
+    const match = message.match(/'([^']+)' column|column "([^"]+)"/i)
+    const column = match?.[1] || match?.[2]
+    if (!column || !(column in payload)) return payload
+    const next = { ...payload }
+    delete next[column]
+    return next
+  }
+
+  async function createQuickProductInventory(_productId: string, _openingQty: number, _costPrice: number, _sellingPrice: number) {
+    // The backend bootstraps inventory + opening stock batch when the
+    // product is created (POST /products) - nothing to do client-side.
+  }
+
+  async function handleAddProduct() {
+    const productCode = quickProductForm.product_code.trim()
+    const productName = quickProductForm.name.trim()
+
+    if (!productCode || !productName || !quickProductForm.supplier_id) {
+      toast.error('Code, Product Name, and Supplier are required')
+      return
+    }
+
+    try {
+      const basePayload: any = {
+        product_code: productCode,
+        name: productName,
+        image_url: quickProductForm.image_url || null,
+        supplier_id: quickProductForm.supplier_id,
+        cost_price: Number(quickProductForm.cost_price || 0),
+        discount: Number(quickProductForm.discount || 0),
+        selling_price: Number(quickProductForm.selling_price || 0),
+        opening_qty: Number(quickProductForm.opening_qty || 0),
+        size: quickProductForm.size || null,
+        weight: quickProductForm.weight || null,
+        is_active: true,
+        owner_id: user?.id,
+      }
+
+      let payload = basePayload
+      let { data: product, error } = await supabase
+        .from('products')
+        .insert(payload)
+        .select('id, product_code, name, cost_price, selling_price, image_url')
+        .maybeSingle()
+
+      for (let attempt = 0; error && attempt < 3; attempt += 1) {
+        const retryPayload = removeMissingProductColumn(payload, error)
+        if (retryPayload === payload) break
+        payload = retryPayload
+        const retry = await supabase
+          .from('products')
+          .insert(payload)
+          .select('id, product_code, name, cost_price, selling_price, image_url')
+          .maybeSingle()
+        product = retry.data
+        error = retry.error
+      }
+
+      if (error) {
+        if (error.code === '23505' || String(error.message || '').toLowerCase().includes('duplicate')) {
+          toast.error('Product code already exists')
+          return
+        }
+        throw error
+      }
+      if (!product) throw new Error('Failed to create product')
+
+      await createQuickProductInventory(product.id, quickProductForm.opening_qty, quickProductForm.cost_price, quickProductForm.selling_price)
+      setProducts(current => [product, ...current.filter(item => item.id !== product.id)])
+      setItems(current => current.map((item, index) => index === current.length - 1 && !item.product_code
+        ? applySpPercent({
+            ...item,
+            product_id: product.id,
+            product_code: product.product_code,
+            product_name: product.name,
+            dp_price: Number(product.cost_price || 0),
+            actual_dp: Number(product.cost_price || 0),
+            total_amount: Number(product.cost_price || 0) * item.qty,
+          }, spPercent)
+        : item
+      ))
+      setShowQuickAddProduct(false)
+      resetQuickProductForm()
+      toast.success('Product added. You can select it now.')
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to add product')
+    }
+  }
+
+  function updateItem(idx: number, field: string, value: any) {
+    const newItems = [...items]
+    newItems[idx] = { ...newItems[idx], [field]: value }
+
+    if (field === 'product_code') {
+      const p = products.find(p => p.product_code?.toLowerCase() === value.toLowerCase())
+      if (p) {
+        newItems[idx].product_id = p.id
+        newItems[idx].product_name = p.name
+        newItems[idx].dp_price = Number(p.cost_price || 0)
+        newItems[idx].discount_pct = Number(p.dp_discount ?? p.discount ?? 0)
+      }
+    }
+
+    const item = newItems[idx]
+    item.actual_dp = actualDp(item.dp_price, item.discount_pct)
+    item.total_amount = roundTaka(item.actual_dp * item.qty)
+    newItems[idx] = applySpPercent(item, spPercent)
+    setItems(newItems)
+  }
+
+  // Changing the percentage re-prices the incentive on every row at once.
+  function changeSpPercent(value: number) {
+    const percent = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
+    setSpPercent(percent)
+    setItems(current => current.map(item => applySpPercent(item, percent)))
+  }
+
+  const totalAmount = items.reduce((s, i) => s + i.total_amount, 0)
+  const selectedSupplier = suppliers.find(s => s.id === form.supplier_id)
+  const previousBalance = Number(supplierBalanceById[form.supplier_id] || 0)
+  const grossSubtotal = items.reduce((s, i) => s + Number(i.dp_price || 0) * Number(i.qty || 0), 0)
+  const discountAmount = Math.max(0, grossSubtotal - totalAmount)
+  const totalSpAmount = items.reduce((s, i) => s + Number(i.sp_amount || 0), 0)
+  const totalActualDeposit = items.reduce((s, i) => s + Number(i.deposit_amount || 0), 0)
+  const totalPayable = totalAmount - previousBalance
+  // supplierBalance signs a positive as money THEY hold for us - paid ahead -
+  // and a negative as money we still owe. The strip below turns that into
+  // words and an operator rather than showing a signed number, which read as
+  // a debt when it was the opposite.
+  const holdsAdvance = previousBalance > 0
+  const owesAfterOrder = totalPayable >= 0
+  const productCategories = useMemo(() => {
+    const set = new Set<string>()
+    products.forEach((product: any) => {
+      const category = String(product.category || '').trim()
+      if (category) set.add(category)
+    })
+    return Array.from(set).sort()
+  }, [products])
+
+  const filteredProducts = useMemo(() => {
+    const q = productSearch.trim().toLowerCase()
+    return products.filter((product: any) => {
+      const matchesSearch = !q ||
+        String(product.name || '').toLowerCase().includes(q) ||
+        String(product.product_code || '').toLowerCase().includes(q)
+      const matchesCategory = !categoryFilter || String(product.category || '') === categoryFilter
+      return matchesSearch && matchesCategory
+    })
+  }, [productSearch, products, categoryFilter])
+
+  function addProductToOrder(product: any) {
+    const dp = roundTaka(product.cost_price)
+    const discount = Number(product.dp_discount ?? product.discount ?? 0)
+    const actual = actualDp(dp, discount)
+    const nextItem: PurchaseItem = applySpPercent({
+      product_id: product.id,
+      product_code: product.product_code || '',
+      product_name: product.name || '',
+      dp_price: dp,
+      discount_pct: discount,
+      actual_dp: actual,
+      qty: 1,
+      total_amount: actual,
+      sp_amount: 0,
+      deposit_amount: actual,
+      received_qty: 0,
+    }, spPercent)
+
+    setItems(current => {
+      // If this product is already in the order, bump its quantity instead of
+      // adding a duplicate row.
+      const existingIndex = current.findIndex(item => item.product_id && item.product_id === product.id)
+      if (existingIndex >= 0) {
+        const next = [...current]
+        const ex = next[existingIndex]
+        const qty = Number(ex.qty || 0) + 1
+        const total = roundTaka(Number(ex.actual_dp || 0) * qty)
+        next[existingIndex] = applySpPercent({ ...ex, qty, total_amount: total }, spPercent)
+        return next
+      }
+      const emptyIndex = current.findIndex(item => !item.product_code && !item.product_name)
+      if (emptyIndex >= 0) {
+        const next = [...current]
+        next[emptyIndex] = nextItem
+        return next
+      }
+      return [...current, nextItem]
+    })
+  }
+
+  function removeItem(index: number) {
+    setItems(current => current.length > 1
+      ? current.filter((_, itemIndex) => itemIndex !== index)
+      : [{ product_id: '', product_code: '', product_name: '', dp_price: 0, discount_pct: 0, actual_dp: 0, qty: 1, total_amount: 0, sp_amount: 0, deposit_amount: 0, received_qty: 0 }]
+    )
+  }
+
+  async function save() {
+    if (!form.supplier_id) return toast.error(t('common_fillAllFields'))
+    if (items.length === 0) return toast.error(t('purchase_addAtLeastOneProduct'))
+
+    const hasAllFields = items.every(i => i.product_code && i.product_name && i.qty > 0 && i.dp_price > 0)
+    if (!hasAllFields) return toast.error(t('purchase_fillAllProductFields'))
+
+    // Saving as "Received" moves stock, so it is confirmed first. Previously it
+    // only wrote the word on the order: the items stayed at zero received, the
+    // ledger went on showing Pending, and - the part that actually mattered -
+    // nothing was ever added to inventory.
+    const receiveNow = form.shipping_status === 'received'
+    if (receiveNow) {
+      const totalQty = items.reduce((sum, item) => sum + Number(item.qty || 0), 0)
+      const confirmed = await confirmAction({
+        title: 'Receive this order into stock?',
+        message: `Saving with status "Received" adds ${totalQty} item(s) to your stock right away. Choose "Pending Receive" instead if the goods have not arrived yet.`,
+        confirmText: 'Yes, receive into stock',
+        cancelText: 'Cancel',
+      })
+      if (!confirmed) return
+    }
+
+    try {
+      const sup = suppliers.find(s => s.id === form.supplier_id)
+      const due = totalAmount
+
+      // One transactional request creates the purchase with all items.
+      const created = await createPurchaseRequest({
+        si_no: form.si_no,
+        supplier_id: form.supplier_id,
+        supplier_name: sup?.name || '',
+        date: form.date,
+        notes: form.notes,
+        shipping_status: form.shipping_status,
+        total_amount: totalAmount,
+        net_amount: totalAmount,
+        paid_amount: 0,
+        due_amount: due,
+        items: items.map(i => ({
+          product_id: dbProductId(i.product_id),
+          product_code: i.product_code,
+          product_name: i.product_name,
+          dp_price: i.dp_price,
+          discount_pct: i.discount_pct,
+          actual_dp: i.actual_dp,
+          qty: i.qty,
+          total_amount: i.total_amount,
+          // The real percentage, not 0. sp_pct is a column and was always sent
+          // as zero, so a reopened order could not show which percentage it was
+          // placed at - and re-saving it recomputed the incentive from 0 and
+          // wiped it.
+          sp_pct: spPercent,
+          sp_amount: i.sp_amount,
+          received_qty: 0,
+        })),
+      })
+
+      // Receiving goes through the same endpoint the Product Received page
+      // uses, rather than writing received_qty directly - that is what records
+      // the receipt, adds the stock and lays down the FIFO cost layer, so a
+      // purchase received here is costed identically to one received there.
+      if (receiveNow) {
+        // One atomic call, not a loop. Receiving line by line meant a failure on
+        // item 3 of 5 left items 1-2 in stock and 3-5 not, and the error said
+        // nothing about which had landed - the operator had to read the ledger to
+        // find out. Now either the whole order is in stock or none of it is.
+        await receiveAllPurchaseItems(created.id, {
+          receive_date: form.date,
+          receiver_name: '',
+          notes: 'Received on order creation',
+        })
+      }
+
+      await clearPublishedDraft()
+
+      await touchOwnerActivity(true)
+      toast.success(receiveNow ? 'Purchase order saved and received into stock' : t('common_saved'))
+      setShowModal(false)
+      setForm({
+        si_no: generateSINo(), supplier_id: '', supplier_name: '',
+        date: todayISO(),
+        account_id: '', notes: '', shipping_status: 'pending',
+      })
+      setItems([{ product_id: '', product_code: '', product_name: '', dp_price: 0, discount_pct: 0, actual_dp: 0, qty: 1, total_amount: 0, sp_amount: 0, deposit_amount: 0, received_qty: 0 }])
+      // Clear the incentive too - a percentage left over from the last order
+      // would price the next one without anyone asking for it.
+      setSpPercent(0)
+      loadAll()
+    } catch (err: any) {
+      console.error('Save exception:', err)
+      toast.error(err.message || 'An error occurred')
+    }
+  }
+
+  async function saveReceive() {
+    if (!receiveItem) return
+
+    // Wrapped, like every sibling handler in this file. It was the one that
+    // wasn't: on a 403 from a lapsed subscription, a 500, or a dropped
+    // connection, the promise rejected unhandled - no toast, no error, the modal
+    // just sat there and the success message never came. The stock had not been
+    // received and nothing on screen said so.
+    try {
+      // The backend records the receive, bumps item/inventory quantities,
+      // creates the FIFO batch and refreshes the shipping status atomically.
+      await receivePurchaseItem(receiveItem.purchase_id, {
+        purchase_item_id: receiveItem.id,
+        receive_date: receiveForm.receive_date,
+        receiver_name: receiveForm.receiver_name,
+        received_qty: receiveForm.received_qty,
+        condition: receiveForm.condition,
+        notes: receiveForm.notes,
+      })
+
+      await touchOwnerActivity(true)
+      toast.success(t('common_saved'))
+      setShowReceiveModal(false)
+      loadAll()
+    } catch (error: any) {
+      // The modal stays open on purpose, so the entered quantity is not lost.
+      toast.error(error?.message || 'Could not record this receive')
+    }
+  }
+
+  async function handleEditReceive() {
+    if (!editingReceiveId || editReceiveQty < 0) return
+    try {
+      // Adjusts receive qty, item totals, inventory and FIFO batch server-side.
+      await updatePurchaseReceive(editingReceiveId, editReceiveQty)
+      await touchOwnerActivity(true)
+      toast.success('Updated successfully')
+      setShowEditReceiveModal(false)
+      setEditingReceiveId(null)
+      loadAll()
+    } catch (error: any) {
+      // Say what went wrong. "Failed to update" with the reason only in the
+      // console is why a stock edit that the server refused looked like the app
+      // was broken rather than like the input needed fixing.
+      toast.error(error?.message || 'Failed to update this receive')
+    }
+  }
+
+  async function handleDeleteReceive(receiveId: string) {
+    if (!(await confirmAction({ message: 'Delete this receiving record?' }))) return
+    try {
+      await deletePurchaseReceive(receiveId)
+      await touchOwnerActivity(true)
+      toast.success('Deleted successfully')
+      loadAll()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to delete this receive')
+    }
+  }
+
+  async function handleEditPO(po: any) {
+    setEditingPOId(po.id)
+    setEditPOForm({ si_no: po.si_no, date: po.date, supplier_id: po.supplier_id })
+    setShowEditPOModal(true)
+  }
+
+  async function saveEditPO() {
+    if (!editingPOId) return
+    try {
+      const { error } = await supabase
+        .from('purchases')
+        .update({
+          si_no: editPOForm.si_no,
+          date: editPOForm.date,
+          supplier_id: editPOForm.supplier_id,
+        })
+        .eq('id', editingPOId)
+
+      if (error) throw error
+      await touchOwnerActivity(true)
+      toast.success('Updated successfully')
+      setShowEditPOModal(false)
+      setEditingPOId(null)
+      loadAll()
+    } catch (error) {
+      toast.error('Failed to update')
+      console.error(error)
+    }
+  }
+
+  async function handleDeletePO(poId: string) {
+    if (!(await confirmAction({ message: 'Delete this purchase order? This will also delete all receiving records.' }))) return
+    try {
+      const purchase = purchases.find(po => po.id === poId)
+      if (purchase) {
+        addRecycleItem({
+          type: 'purchases',
+          title: purchase.supplier_name || '-',
+          subtitle: purchase.si_no || '-',
+          amount: Number(purchase.net_amount || 0),
+          data: purchase,
+        })
+      }
+      const { error } = await supabase
+        .from('purchases')
+        .delete()
+        .eq('id', poId)
+
+      if (error) throw error
+      await touchOwnerActivity(true)
+      toast.success('Deleted successfully')
+      loadAll()
+    } catch (error) {
+      toast.error('Failed to delete')
+      console.error(error)
+    }
+  }
+
+  const statusColors: Record<string, string> = {
+    pending: 'badge-orange',
+    partial: 'badge-blue',
+    received: 'badge-green',
+  }
+
+  const allProducts = purchases.flatMap(po => {
+    return (po.purchase_items || []).map((item: any) => {
+      const receivedQty = (item.purchase_receives || []).reduce((sum: number, r: any) => sum + (r.received_qty || 0), 0)
+      const pendingQty = item.qty - receivedQty
+      return {
+        id: item.id,
+        si_no: po.si_no,
+        purchase_id: po.id,
+        date: po.date,
+        company: po.supplier_name,
+        product_code: item.product_code,
+        product_name: item.product_name,
+        dp_price: item.dp_price,
+        discount_pct: item.discount_pct,
+        actual_dp: item.actual_dp,
+        qty: item.qty,
+        total_amount: item.total_amount,
+        discount_amount: (item.dp_price * item.discount_pct / 100) * item.qty,
+        // Derived, not read back: there is no deposit_amount column, so this
+        // used to render Tk 0 on every saved order while Purchase History and
+        // the Monthly Report derived it and showed the real figure.
+        deposit_amount: purchaseItemDeposit(item),
+        received_qty: receivedQty,
+        pending_qty: pendingQty,
+        shipping_status: po.shipping_status,
+      }
+    })
+  })
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden p-6">
+      <PageHeader
+        title="Purchase Order"
+        subtitle="Create and manage purchase orders for your products"
+        actions={
+          <div className="flex flex-wrap gap-3 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-navy-800 shadow-sm">
+            <span className="inline-flex items-center gap-2"><span className="h-3 w-3 rounded-full bg-brand-orange" /> Pending Receive</span>
+            <span className="inline-flex items-center gap-2"><span className="h-3 w-3 rounded-full bg-slate-500" /> Partially Received</span>
+            <span className="inline-flex items-center gap-2"><span className="h-3 w-3 rounded-full bg-brand-green" /> Received</span>
+            <span className="inline-flex items-center gap-2"><span className="h-3 w-3 rounded-full bg-red-600" /> Cancelled</span>
+          </div>
+        }
+      />
+
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 xl:grid-cols-[430px_1fr]">
+        <section className="card flex min-h-0 flex-col overflow-hidden p-4">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-base font-bold text-navy-800">Select Products</h2>
+          </div>
+          <div className="mb-4 flex gap-2">
+            <div className="relative min-w-0 flex-1">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                className="input pl-9"
+                value={productSearch}
+                onChange={e => setProductSearch(e.target.value)}
+                placeholder="Search by product name or code..."
+              />
+            </div>
+            <button onClick={() => setShowQuickAddProduct(true)} className="btn-secondary aspect-square px-3 text-brand-green" title="Add new product">
+              <Plus size={18} />
+            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowCategoryFilter(value => !value)}
+                className={`btn-secondary aspect-square px-3 ${categoryFilter ? 'border-slate-900 text-slate-900' : 'text-slate-500'}`}
+                title="Filter by category"
+              >
+                <SlidersHorizontal size={17} />
+              </button>
+              {showCategoryFilter && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShowCategoryFilter(false)} />
+                  <div className="absolute right-0 top-full z-20 mt-1 max-h-72 w-52 overflow-y-auto rounded-lg border border-slate-200 bg-white py-1 shadow-xl">
+                    <button
+                      type="button"
+                      onClick={() => { setCategoryFilter(''); setShowCategoryFilter(false) }}
+                      className={`block w-full px-3 py-2 text-left text-xs hover:bg-neutral-100 ${!categoryFilter ? 'font-bold text-slate-900' : 'text-slate-600'}`}
+                    >
+                      All categories
+                    </button>
+                    {productCategories.map(category => (
+                      <button
+                        key={category}
+                        type="button"
+                        onClick={() => { setCategoryFilter(category); setShowCategoryFilter(false) }}
+                        className={`block w-full px-3 py-2 text-left text-xs hover:bg-neutral-100 ${categoryFilter === category ? 'font-bold text-slate-900' : 'text-slate-600'}`}
+                      >
+                        {category}
+                      </button>
+                    ))}
+                    {productCategories.length === 0 && <p className="px-3 py-2 text-xs text-slate-400">No categories</p>}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+            {filteredProducts.map(product => {
+              const stock = inventoryByProduct[product.id] || 0
+              return (
+                <div key={product.id} className="flex items-center gap-3 rounded-lg border border-slate-100 bg-white p-3 shadow-sm">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-white">
+                    {product.image_url ? (
+                      <img src={product.image_url} alt={product.name} loading="lazy" decoding="async" className="h-full w-full object-cover" />
+                    ) : (
+                      <Package size={22} className="text-slate-300" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    {/* title, so a clipped name can still be read. These run
+                        long - "Wooden Cupboard-HCBH-314-3-10(Three Door)" - and
+                        the card is too narrow to widen. */}
+                    <p title={product.name} className="truncate text-xs font-bold text-navy-800">{product.name}</p>
+                    <p className="mt-0.5 font-mono text-xs text-slate-500">{product.product_code}</p>
+                    <p className="mt-1 text-xs font-semibold text-slate-500">
+                      <span className="text-brand-green">৳</span> Stock: <span className={stock > 0 ? 'text-navy-800' : 'text-brand-red'}>{stock}</span>
+                    </p>
+                  </div>
+                  <button onClick={() => addProductToOrder(product)} className="btn-primary px-3 py-1.5 text-xs">
+                    Add
+                  </button>
+                </div>
+              )
+            })}
+            {filteredProducts.length === 0 && (
+              <div className="rounded-lg border border-dashed border-slate-200 py-10 text-center text-sm text-slate-400">No products found</div>
+            )}
+          </div>
+        </section>
+
+        <div className="min-h-0 space-y-5 overflow-y-auto pr-1 pb-1">
+          <section className="card p-5">
+            <h2 className="mb-4 text-base font-bold text-navy-800">Supplier & Purchase Order Info</h2>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <label>
+                <span className="label">Supplier <span className="text-brand-red">*</span></span>
+                <select className="input" value={form.supplier_id} onChange={e => setForm({ ...form, supplier_id: e.target.value })}>
+                  <option value="">Select Supplier</option>
+                  {suppliers.map(s => <option key={s.id} value={s.id}>{s.company_name || s.name}</option>)}
+                </select>
+              </label>
+              <label>
+                <span className="label">Supplier Name</span>
+                <input className="input bg-white" value={selectedSupplier?.company_name || selectedSupplier?.name || ''} placeholder="Auto populated" readOnly />
+              </label>
+              <label>
+                <span className="label">Supplier Phone</span>
+                <input className="input bg-white" value={selectedSupplier?.phone || ''} placeholder="Auto populated" readOnly />
+              </label>
+              <label>
+                <span className="label">Purchase Order No</span>
+                <input className="input font-mono" value={form.si_no} onChange={e => setForm({ ...form, si_no: e.target.value })} />
+              </label>
+              <label>
+                <span className="label">Date</span>
+                <input type="date" className="input" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} />
+              </label>
+              <label>
+                <span className="label">Order Status</span>
+                <select
+                  className={`input font-semibold ${ORDER_STATUS_META[form.shipping_status].textClass}`}
+                  value={form.shipping_status}
+                  onChange={e => setForm({ ...form, shipping_status: e.target.value as OrderStatus })}
+                >
+                  {ORDER_STATUS_OPTIONS.map(option => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      disabled={option.disabledOnCreate}
+                      // Inline colour: a native option list cannot be styled by
+                      // class, and this is what browsers do honour.
+                      style={{ color: option.hex }}
+                    >
+                      {option.dot} {option.label}{option.disabledOnCreate ? ' - receive on the Product Received page' : ''}
+                    </option>
+                  ))}
+                </select>
+                {/* Says plainly what saving as Received will do, because it
+                    moves stock rather than only labelling the order. */}
+                {form.shipping_status === 'received' && (
+                  <p className="mt-1 text-xs font-medium text-brand-green">
+                    All items will be received in full and added to stock when you submit.
+                  </p>
+                )}
+              </label>
+            </div>
+          </section>
+
+          <section className="card p-5">
+            <h2 className="mb-4 text-base font-bold text-navy-800">Purchase Items</h2>
+            <TableScroller className="overflow-x-auto rounded-lg border border-slate-100">
+              <table className="w-full min-w-[1240px] text-xs">
+                <thead className="bg-white text-[11px] font-bold uppercase text-navy-800">
+                  <tr className="whitespace-nowrap">
+                    <th className="px-3 py-3 text-left">#</th>
+                    <th className="px-3 py-3 text-left">Product Code</th>
+                    <th className="px-3 py-3 text-left">Product</th>
+                    <th className="px-3 py-3 text-right">DP Amount</th>
+                    <th className="px-3 py-3 text-right">Discount %</th>
+                    <th className="px-3 py-3 text-right">Actual DP</th>
+                    <th className="px-3 py-3 text-right">Quantity</th>
+                    <th className="px-3 py-3 text-right">Total</th>
+                    <th className="px-3 py-3 text-right">SP Amount</th>
+                    <th className="px-3 py-3 text-right">Actual Deposit Amount</th>
+                    <th className="px-3 py-3 text-center">Status</th>
+                    <th className="px-3 py-3 text-center">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((item, idx) => {
+                    const productImage = products.find(p => p.id === item.product_id)?.image_url
+                    return (
+                      <tr key={idx} className="whitespace-nowrap border-t border-slate-100 bg-white">
+                        <td className="px-3 py-3 font-semibold text-slate-500">{idx + 1}</td>
+                        <td className="px-3 py-3">
+                          <input className="input h-10 w-24 text-xs" value={item.product_code} onChange={e => updateItem(idx, 'product_code', e.target.value)} list={`product-codes-new-${idx}`} />
+                          <datalist id={`product-codes-new-${idx}`}>
+                            {products.map(p => <option key={p.id} value={p.product_code || ''} />)}
+                          </datalist>
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-md bg-white">
+                              {productImage ? <img src={productImage} alt={item.product_name} loading="lazy" decoding="async" className="h-full w-full object-cover" /> : <Package size={16} className="text-slate-300" />}
+                            </div>
+                            <span title={item.product_name || ''} className="max-w-[180px] truncate font-semibold text-navy-800">{item.product_name || '-'}</span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-3"><input type="number" min="0" className="input h-10 w-24 text-right text-xs" value={item.dp_price || ''} onChange={e => updateItem(idx, 'dp_price', Number(e.target.value))} /></td>
+                        <td className="px-3 py-3"><input type="number" min="0" max="100" className="input h-10 w-16 text-right text-xs" value={item.discount_pct || ''} onChange={e => updateItem(idx, 'discount_pct', Number(e.target.value))} /></td>
+                        <td className="px-3 py-3 text-right font-bold text-navy-800">{formatCurr(item.actual_dp)}</td>
+                        <td className="px-3 py-3"><input type="number" min="1" className="input h-10 w-20 text-right text-xs" value={item.qty} onChange={e => updateItem(idx, 'qty', Number(e.target.value))} /></td>
+                        <td className="px-3 py-3 text-right font-bold text-navy-800">{formatCurr(item.total_amount)}</td>
+                        <td className="px-3 py-3"><input type="number" readOnly tabIndex={-1} title="Set by the SP % field in the order summary" className="input h-10 w-24 cursor-not-allowed bg-white text-right text-xs text-slate-600" value={item.sp_amount || ''} /></td>
+                        {/* Read-only like the SP cell before it: the deposit is
+                            total less the incentive, so there is nothing to type.
+                            It was an editable input, but applySpPercent overwrote
+                            whatever was typed and no deposit_amount column exists
+                            to save it to - so the figure came back as Tk 0. */}
+                        <td className="px-3 py-3 text-right"><input type="number" readOnly tabIndex={-1} title="Total less the SP incentive" className="input h-10 w-28 cursor-not-allowed bg-white text-right text-xs font-bold text-navy-800" value={item.deposit_amount || ''} /></td>
+                        <td className="px-3 py-3 text-center"><span className="rounded-md bg-brand-orange-soft px-2 py-1 text-[11px] font-bold text-brand-orange">●Pending</span></td>
+                        <td className="px-3 py-3 text-center">
+                          <button onClick={() => removeItem(idx)} className="rounded-md border border-red-100 bg-red-50 p-2 text-brand-red hover:bg-red-100" title="Remove">
+                            <Trash2 size={14} />
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </TableScroller>
+            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-xs font-medium text-slate-600">
+              <Info size={15} className="mr-2 inline" /> Product code, product name and image are auto-filled from the selected product in the product list.
+            </div>
+            <button onClick={() => setItems([...items, { product_id: '', product_code: '', product_name: '', dp_price: 0, discount_pct: 0, actual_dp: 0, qty: 1, total_amount: 0, sp_amount: 0, deposit_amount: 0, received_qty: 0 }])} className="btn-secondary mt-4 text-xs">
+              <Plus size={14} /> Add New Row
+            </button>
+          </section>
+
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_420px]">
+            <section className="card p-6">
+              <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-5 text-center">
+                {/* Every figure here is shown as a magnitude and the OPERATOR
+                    carries the direction, because that is how the line is read
+                    aloud: "I have 114,335 with them, minus this 1,980 order,
+                    leaves 112,355". It used to print a fixed "+" over a
+                    subtraction and then show the answer as -112,355 - money
+                    the shop is owed, wearing a minus sign. */}
+                <div>
+                  <p className="text-xs font-bold text-navy-800">{holdsAdvance ? 'Advance With Supplier' : 'Previous Due'}</p>
+                  <p className="mt-1 text-xs text-slate-500">{holdsAdvance ? 'Paid ahead, not yet used' : 'Owed from earlier orders'}</p>
+                  <p className={`mt-3 text-2xl font-bold ${holdsAdvance ? 'text-brand-green' : 'text-brand-red'}`}>{formatCurr(Math.abs(previousBalance))}</p>
+                </div>
+                <span className="text-2xl font-bold text-navy-800">{holdsAdvance ? '-' : '+'}</span>
+                <div>
+                  <p className="text-xs font-bold text-navy-800">Current Purchase Amount</p>
+                  <p className="mt-1 text-xs text-slate-500">This order value</p>
+                  <p className="mt-3 text-2xl font-bold text-brand-green">{formatCurr(totalAmount)}</p>
+                </div>
+                <span className="text-2xl font-bold text-navy-800">=</span>
+                <div>
+                  <p className="text-xs font-bold text-navy-800">{owesAfterOrder ? 'Total Payable' : 'Advance Remaining'}</p>
+                  <p className="mt-1 text-xs text-slate-500">{owesAfterOrder ? 'Amount to pay' : 'Still yours with them'}</p>
+                  <p className={`mt-3 text-2xl font-bold ${owesAfterOrder ? 'text-navy-800' : 'text-brand-green'}`}>{formatCurr(Math.abs(totalPayable))}</p>
+                </div>
+              </div>
+              <div className="mt-8 rounded-lg border border-slate-200 bg-white px-4 py-3 text-xs font-medium text-slate-600">
+                <Info size={15} className="mr-2 inline" /> {holdsAdvance
+                  ? 'You have paid this supplier ahead. This order is taken off that advance; what is left stays yours with them.'
+                  : 'What was owed from earlier orders, plus this one. The balance comes from the Supplier Dashboard.'}
+              </div>
+            </section>
+
+            <section className="card p-5">
+              <div className="space-y-4 border-b border-slate-100 pb-4 text-sm">
+                <div className="flex justify-between"><span className="text-navy-800">Subtotal</span><span className="font-semibold text-navy-800">{formatCurr(grossSubtotal)}</span></div>
+                <div className="flex justify-between"><span className="text-navy-800">Discount</span><span className="font-semibold text-brand-red">-{formatCurr(discountAmount)}</span></div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-navy-800">SP %</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-500">{formatCurr(totalSpAmount)}</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="0.01"
+                      className="input h-9 w-20 text-right text-sm"
+                      value={spPercent || ''}
+                      onChange={e => changeSpPercent(Number(e.target.value))}
+                      placeholder="0"
+                      title="Incentive percentage - fills the SP Amount of every item"
+                    />
+                  </div>
+                </div>
+              </div>
+              <div className="mt-5 flex justify-between text-lg font-bold">
+                <span className="text-navy-800">Grand Total</span>
+                <span className="text-brand-green">{formatCurr(totalActualDeposit || totalAmount)}</span>
+              </div>
+              <div className="mt-6 flex gap-2">
+                {/* text-sm, not text-base: side by side the longer label
+                    wrapped onto two lines and the pair stopped matching. */}
+                <button onClick={save} className="btn-primary h-14 flex-1 justify-center whitespace-nowrap text-sm">
+                  <ShoppingCart size={18} /> Submit Purchase Order
+                </button>
+                {/* Parks the order as it stands - no validation, because a
+                    half-finished order is the whole point of the button. */}
+                <button
+                  onClick={saveAsDraft}
+                  disabled={savingDraft}
+                  className="btn-secondary h-14 justify-center whitespace-nowrap px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Save this order and finish it later"
+                >
+                  <Save size={18} /> {savingDraft ? 'Saving...' : draftId ? 'Update Draft' : 'Draft Order'}
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <div className="rounded-lg border border-brand-blue/30 bg-brand-blue-soft px-4 py-3 text-xs font-medium text-brand-blue">
+            <Info size={15} className="mr-2 inline" /> After submission, this purchase order will appear in Purchase → Product Received. Inventory will be increased only after you confirm the items are received.
+          </div>
+        </div>
+      </div>
+
+      <div className="hidden">
+
+      <div>
+        <h3 className="text-sm font-semibold text-slate-700 mb-3">All Ordered Products</h3>
+        <div className="card overflow-x-auto p-0">
+          <table className="w-full text-xs">
+            <thead className="table-header">
+              <tr>
+                <th className="text-left py-2 px-2">#</th>
+                <th className="text-left py-2 px-2">SI No</th>
+                <th className="text-left py-2 px-2">Company</th>
+                <th className="text-left py-2 px-2">Date</th>
+                <th className="text-left py-2 px-2">Product Code</th>
+                <th className="text-left py-2 px-2">Product Name</th>
+                <th className="text-right py-2 px-2">DP Price</th>
+                <th className="text-right py-2 px-2">Discount %</th>
+                <th className="text-right py-2 px-2">Actual DP</th>
+                <th className="text-right py-2 px-2">QTY</th>
+                <th className="text-right py-2 px-2">Total Amount</th>
+                <th className="text-right py-2 px-2">Discount Amount</th>
+                <th className="text-right py-2 px-2">Actual Deposit</th>
+                <th className="text-center py-2 px-2">Received</th>
+                <th className="text-center py-2 px-2">Pending</th>
+                <th className="text-center py-2 px-2">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {allProducts.map((product, idx) => (
+                <tr key={product.id} className="border-t border-slate-100 hover:bg-neutral-100">
+                  <td className="py-2 px-2 text-slate-500">{idx + 1}</td>
+                  <td className="py-2 px-2 font-medium">{product.si_no}</td>
+                  <td className="py-2 px-2">{product.company}</td>
+                  <td className="py-2 px-2">{formatDate(product.date)}</td>
+                  <td className="py-2 px-2 font-mono text-xs bg-white px-2 py-1 rounded">{product.product_code}</td>
+                  <td className="py-2 px-2 text-slate-700">{product.product_name}</td>
+                  <td className="py-2 px-2 text-right">{formatCurr(product.dp_price)}</td>
+                  <td className="py-2 px-2 text-right">{product.discount_pct}%</td>
+                  <td className="py-2 px-2 text-right font-medium">{formatCurr(product.actual_dp)}</td>
+                  <td className="py-2 px-2 text-right font-semibold">{product.qty}</td>
+                  <td className="py-2 px-2 text-right font-semibold">{formatCurr(product.total_amount)}</td>
+                  <td className="py-2 px-2 text-right">{formatCurr(product.discount_amount)}</td>
+                  <td className="py-2 px-2 text-right">{formatCurr(product.deposit_amount)}</td>
+                  <td className="py-2 px-2 text-center text-green-600 font-semibold">{product.received_qty}</td>
+                  <td className={`py-2 px-2 text-center font-semibold ${product.pending_qty > 0 ? 'text-brand-orange' : 'text-brand-green'}`}>
+                    {product.pending_qty}
+                  </td>
+                  <td className="py-2 px-2 text-center">
+                    <span className={`text-xs px-2 py-1 rounded font-medium ${
+                      product.pending_qty === 0 ? 'bg-green-100 text-green-700' :
+                      product.pending_qty > 0 && product.shipping_status === 'partial' ? 'bg-slate-100 text-slate-700' :
+                      'bg-brand-orange-soft text-brand-orange'
+                    }`}>
+                      {product.pending_qty === 0 ? 'Received' : product.pending_qty > 0 && product.shipping_status === 'partial' ? 'Partial' : 'Pending'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+              {allProducts.length === 0 && (
+                <tr>
+                  <td colSpan={16} className="text-center py-8 text-slate-400">
+                    No products found. Create a purchase order first.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-sm font-semibold text-slate-700 mb-3">Purchase Orders</h3>
+        <div className="card overflow-x-auto p-0">
+          <table className="w-full text-sm">
+            <thead className="table-header">
+              <tr>
+                <th className="py-2 px-3 w-8"></th>
+                <th className="text-left py-2 px-3">{t('purchase_colDate')}</th>
+                <th className="text-left py-2 px-3">{t('purchase_colSupplier')}</th>
+                <th className="text-right py-2 px-3">{t('purchase_colTotal')}</th>
+                <th className="text-center py-2 px-3">{t('purchase_colShipping')}</th>
+                <th className="text-center py-2 px-3">Status</th>
+                <th className="text-center py-2 px-3">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {purchases.map(po => (
+                <React.Fragment key={po.id}>
+                  <tr className="table-row cursor-pointer" onClick={() => setExpandedId(expandedId === po.id ? null : po.id)}>
+                    <td className="py-2.5 px-3 text-slate-400">{expandedId === po.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</td>
+                    <td className="py-2.5 px-3">{formatDate(po.date)}</td>
+                    <td className="py-2.5 px-3 font-medium">{po.supplier_name}</td>
+                    <td className="py-2.5 px-3 text-right font-medium">{formatCurr(po.total_amount)}</td>
+                    <td className="py-2.5 px-3 text-center">
+                      <span className={`text-xs px-2 py-1 rounded font-medium ${
+                        po.shipping_status === 'received' ? 'bg-green-100 text-green-700' :
+                        po.shipping_status === 'partial' ? 'bg-slate-100 text-slate-700' :
+                        'bg-brand-orange-soft text-brand-orange'
+                      }`}>
+                        {po.shipping_status?.charAt(0).toUpperCase() + po.shipping_status?.slice(1)}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-center"><span className={statusColors[po.shipping_status]}>{po.shipping_status}</span></td>
+                    <td className="py-2.5 px-3 text-center flex items-center justify-center gap-1" onClick={e => e.stopPropagation()}>
+                      <button
+                        onClick={() => handleEditPO(po)}
+                        className="text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 px-2 py-1 rounded flex items-center gap-1"
+                        title="Edit"
+                      >
+                        <Edit2 size={12} />
+                      </button>
+                      <button
+                        onClick={() => handleDeletePO(po.id)}
+                        className="text-xs bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded flex items-center gap-1"
+                        title="Delete"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                  {expandedId === po.id && (
+                    <tr><td colSpan={7} className="bg-white px-4 py-4">
+                      <div className="space-y-4">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-700 mb-2">ORDER DETAILS</h4>
+                          <table className="w-full text-xs overflow-x-auto">
+                            <thead><tr className="bg-slate-100">
+                              <th className="text-left py-2 px-2">Line</th>
+                              <th className="text-left py-2 px-2">Product Code</th>
+                              <th className="text-left py-2 px-2">Product</th>
+                              <th className="text-right py-2 px-2">DP Amount (৳)</th>
+                              <th className="text-right py-2 px-2">Discount %</th>
+                              <th className="text-right py-2 px-2">Actual DP</th>
+                              <th className="text-right py-2 px-2">Quantity</th>
+                              <th className="text-right py-2 px-2">Total</th>
+                              <th className="text-right py-2 px-2">SP Amount (৳)</th>
+                              <th className="text-right py-2 px-2">Actual Deposit Amount</th>
+                              <th className="text-center py-2 px-2">Status</th>
+                            </tr></thead>
+                            <tbody>
+                              {(po.purchase_items || []).map((item: any, idx: number) => (
+                                <tr key={item.id} className="border-t border-slate-200">
+                                  <td className="py-2 px-2 font-semibold text-slate-600">{idx + 1}</td>
+                                  <td className="py-2 px-2 font-mono text-xs">{item.product_code}</td>
+                                  <td className="py-2 px-2">{item.product_name}</td>
+                                  <td className="py-2 px-2 text-right">{formatCurr(item.dp_price)}</td>
+                                  <td className="py-2 px-2 text-right">{item.discount_pct}%</td>
+                                  <td className="py-2 px-2 text-right">{formatCurr(item.actual_dp)}</td>
+                                  <td className="py-2 px-2 text-right font-semibold">{item.qty}</td>
+                                  <td className="py-2 px-2 text-right">{formatCurr(item.total_amount)}</td>
+                                  <td className="py-2 px-2 text-right">{formatCurr(item.sp_amount)}</td>
+                                  <td className="py-2 px-2 text-right font-semibold">{formatCurr(item.deposit_amount || 0)}</td>
+                                  <td className="py-2 px-2 text-center">
+                                    <span className={statusColors[(item.received_qty || 0) >= item.qty ? 'received' : (item.received_qty || 0) > 0 ? 'partial' : 'pending']}>
+                                      {(item.received_qty || 0) >= item.qty ? 'Received' : (item.received_qty || 0) > 0 ? 'Partial' : 'Pending'}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-700 mb-2">RECEIVING DETAILS</h4>
+                          <table className="w-full text-xs">
+                            <thead><tr className="bg-slate-100">
+                              <th className="text-left py-2 px-2">Line</th>
+                              <th className="text-left py-2 px-2">Receiving Date</th>
+                              <th className="text-right py-2 px-2">Received QTY</th>
+                              <th className="text-right py-2 px-2">Amount (৳)</th>
+                              <th className="text-right py-2 px-2">Undelivered QTY</th>
+                              <th className="text-right py-2 px-2">Undeliv. Amount (৳)</th>
+                              <th className="text-left py-2 px-2">Duration</th>
+                              <th className="py-2 px-2"></th>
+                            </tr></thead>
+                            <tbody>
+                              {(po.purchase_items || []).map((item: any, idx: number) => {
+                                const undeliveredQty = item.qty - (item.received_qty || 0)
+                                const receives = (item.purchase_receives || []).sort((a: any, b: any) => new Date(b.receive_date).getTime() - new Date(a.receive_date).getTime())
+                                const lastReceive = receives[0]
+                                const daysElapsed = lastReceive
+                                  ? Math.floor((new Date().getTime() - new Date(lastReceive.receive_date).getTime()) / (1000 * 60 * 60 * 24))
+                                  : Math.floor((new Date().getTime() - new Date(po.date).getTime()) / (1000 * 60 * 60 * 24))
+                                const months = Math.floor(daysElapsed / 30)
+                                const days = daysElapsed % 30
+                                const durationText = undeliveredQty > 0
+                                  ? `${months} month${months !== 1 ? 's' : ''} ${days} Days to receive`
+                                  : `${months} month${months !== 1 ? 's' : ''} ${days} Days`
+
+                                return (
+                                  <React.Fragment key={item.id}>
+                                    {receives.length > 0 ? receives.map((receive: any, rIdx: number) => {
+                                      const receivedAmount = receive.received_qty * (item.actual_dp)
+                                      return (
+                                        <tr key={receive.id} className="border-t border-slate-200">
+                                          <td className="py-2 px-2">{idx + 1}</td>
+                                          <td className="py-2 px-2">{formatDate(receive.receive_date)}</td>
+                                          <td className="py-2 px-2 text-right">{receive.received_qty}</td>
+                                          <td className="py-2 px-2 text-right">{formatCurr(receivedAmount)}</td>
+                                          <td className="py-2 px-2 text-right">{rIdx === 0 ? undeliveredQty : ''}</td>
+                                          <td className="py-2 px-2 text-right">{rIdx === 0 ? formatCurr(undeliveredQty * item.actual_dp) : ''}</td>
+                                          <td className="py-2 px-2 text-xs">{rIdx === 0 ? durationText : ''}</td>
+                                          <td className="py-2 px-2 flex items-center gap-1">
+                                            {rIdx === 0 && undeliveredQty > 0 && (
+                                              <button
+                                                onClick={() => { setReceiveItem({ ...item, purchase_id: po.id, si_no: po.si_no }); setShowReceiveModal(true) }}
+                                                className="btn-primary !px-2 !py-0.5 !text-xs"
+                                              >
+                                                <Truck size={10} /> Receive
+                                              </button>
+                                            )}
+                                            <button
+                                              onClick={() => {
+                                                setEditingReceiveId(receive.id)
+                                                setEditReceiveQty(receive.received_qty)
+                                                setShowEditReceiveModal(true)
+                                              }}
+                                              className="text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded flex items-center gap-1"
+                                              title="Edit"
+                                            >
+                                              <Edit2 size={10} />
+                                            </button>
+                                            <button
+                                              onClick={() => handleDeleteReceive(receive.id)}
+                                              className="text-xs bg-red-100 hover:bg-red-200 text-red-700 px-1.5 py-0.5 rounded flex items-center gap-1"
+                                              title="Delete"
+                                            >
+                                              <Trash2 size={10} />
+                                            </button>
+                                          </td>
+                                        </tr>
+                                      )
+                                    }) : (
+                                      <tr className="border-t border-slate-200">
+                                        <td className="py-2 px-2">{idx + 1}</td>
+                                        <td className="py-2 px-2 text-slate-400"><NoValue /></td>
+                                        <td className="py-2 px-2 text-right text-slate-400">0</td>
+                                        <td className="py-2 px-2 text-right text-slate-400">0</td>
+                                        <td className="py-2 px-2 text-right">{item.qty}</td>
+                                        <td className="py-2 px-2 text-right">{formatCurr(item.total_amount)}</td>
+                                        <td className="py-2 px-2 text-xs">{durationText}</td>
+                                        <td className="py-2 px-2 flex items-center gap-1">
+                                          <button
+                                            onClick={() => { setReceiveItem({ ...item, purchase_id: po.id, si_no: po.si_no }); setShowReceiveModal(true) }}
+                                            className="btn-primary !px-2 !py-0.5 !text-xs"
+                                          >
+                                            <Truck size={10} /> Receive
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </React.Fragment>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </td></tr>
+                  )}
+                </React.Fragment>
+              ))}
+              {purchases.length === 0 && <tr><td colSpan={8} className="text-center py-8 text-slate-400">{t('purchase_noOrders')}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      </div>
+
+      <Modal isOpen={showModal} onClose={() => setShowModal(false)} title={t('purchase_newOrder')} size="xl">
+        <div className="space-y-4">
+          <div className="grid grid-cols-3 gap-3">
+            <div><label className="label" htmlFor="purchase-orders-f1">SI No</label><input id="purchase-orders-f1" className="input font-mono" value={form.si_no} onChange={e => setForm({ ...form, si_no: e.target.value })} /></div>
+            <div><label className="label" htmlFor="purchase-orders-f2">{t('common_date')}</label><input id="purchase-orders-f2" type="date" className="input" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f3">{t('common_supplier')}</label>
+              <select id="purchase-orders-f3" className="input" value={form.supplier_id} onChange={e => setForm({ ...form, supplier_id: e.target.value })}>
+                <option value="">{t('purchase_selectSupplier')}</option>
+                {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-medium text-slate-700">{t('purchase_productsList')}</label>
+              <div className="flex gap-2">
+                <button onClick={() => setShowQuickAddProduct(true)} className="btn-primary text-xs py-1">
+                  <Plus size={12} /> New Product
+                </button>
+                <button onClick={() => setItems([...items, { product_id: '', product_code: '', product_name: '', dp_price: 0, discount_pct: 0, actual_dp: 0, qty: 1, total_amount: 0, sp_amount: 0, deposit_amount: 0, received_qty: 0 }])} className="btn-secondary text-xs py-1">
+                  <Plus size={12} /> {t('purchase_addProduct')}
+                </button>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="table-header">
+                  <tr>
+                    <th className="text-left py-2 px-2">{t('purchase_productCode')}</th>
+                    <th className="text-left py-2 px-2">{t('purchase_colProduct')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_dpAmount')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_colDiscount')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_actualDp')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_colQty')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_colTotal')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_spAmount')}</th>
+                    <th className="text-right py-2 px-2">{t('purchase_actualDepositAmount')}</th>
+                    <th className="text-center py-2 px-2">{t('purchase_colStatus')}</th>
+                    <th className="py-2 px-2"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((item, idx) => (
+                    <tr key={idx} className="border-b border-slate-100">
+                      <td className="py-1.5 px-2">
+                        <input
+                          type="text"
+                          className="input py-1 text-xs w-24"
+                          value={item.product_code}
+                          onChange={e => updateItem(idx, 'product_code', e.target.value)}
+                          placeholder="Code"
+                          list={`product-codes-${idx}`}
+                        />
+                        <datalist id={`product-codes-${idx}`}>
+                          {products.map(p => (
+                            <option key={p.id} value={p.product_code || ''} />
+                          ))}
+                        </datalist>
+                      </td>
+                      <td className="py-1.5 px-2 font-medium text-slate-700">{item.product_name || <NoValue />}</td>
+                      <td className="py-1.5 px-2"><input type="number" min="0" className="input py-1 text-xs text-right w-24" value={item.dp_price || ''} onChange={e => updateItem(idx, 'dp_price', Number(e.target.value))} /></td>
+                      <td className="py-1.5 px-2"><input type="number" min="0" max="100" className="input py-1 text-xs text-right w-16" value={item.discount_pct || ''} onChange={e => updateItem(idx, 'discount_pct', Number(e.target.value))} /></td>
+                      <td className="py-1.5 px-2 text-right font-medium">{formatCurr(item.actual_dp)}</td>
+                      <td className="py-1.5 px-2"><input type="number" min="1" className="input py-1 text-xs text-right w-14" value={item.qty} onChange={e => updateItem(idx, 'qty', Number(e.target.value))} /></td>
+                      <td className="py-1.5 px-2 text-right font-semibold text-brand-green">{formatCurr(item.total_amount)}</td>
+                      <td className="py-1.5 px-2"><input type="number" min="0" className="input py-1 text-xs text-right w-24" value={item.sp_amount || ''} onChange={e => updateItem(idx, 'sp_amount', Number(e.target.value))} placeholder="SP" /></td>
+                      <td className="py-1.5 px-2 text-right font-semibold text-slate-700">{formatCurr(item.deposit_amount)}</td>
+                      <td className="text-center"><span className="badge-orange text-xs">{t('purchase_statusPending')}</span></td>
+                      <td className="py-1.5 px-2">
+                        {items.length > 1 && <button onClick={() => setItems(items.filter((_, i) => i !== idx))} className="text-red-400">✕</button>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div className="pt-5 text-sm">
+              <div className="flex justify-between"><span className="text-slate-500">{t('purchase_totalLabel')}</span><span className="font-bold">{formatCurr(totalAmount)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">{t('purchase_totalSpAmount')}</span><span className="font-semibold text-brand-red">{formatCurr(items.reduce((s, i) => s + i.sp_amount, 0))}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">{t('purchase_totalActualDeposit')}</span><span className="text-brand-green font-semibold">{formatCurr(items.reduce((s, i) => s + i.deposit_amount, 0))}</span></div>
+            </div>
+          </div>
+          <div><label className="label" htmlFor="purchase-orders-f4">{t('common_note')}</label><textarea id="purchase-orders-f4" className="input" rows={2} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></div>
+          <div className="flex gap-2 pt-2">
+            <button onClick={save} className="btn-primary flex-1 justify-center"><Save size={16} /> {t('common_submit')}</button>
+            <button onClick={() => setShowModal(false)} className="btn-secondary flex-1 justify-center">{t('common_cancel')}</button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={showQuickAddProduct}
+        onClose={() => setShowQuickAddProduct(false)}
+        title="Add New Product"
+        size="lg"
+      >
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="label" htmlFor="purchase-orders-f5">Code *</label>
+              <input id="purchase-orders-f5"
+                type="text"
+                className="input"
+                value={quickProductForm.product_code}
+                onChange={e => setQuickProductForm({ ...quickProductForm, product_code: e.target.value })}
+                placeholder="e.g., SKU-001"
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f6">Product Name *</label>
+              <input id="purchase-orders-f6"
+                type="text"
+                className="input"
+                value={quickProductForm.name}
+                onChange={e => setQuickProductForm({ ...quickProductForm, name: e.target.value })}
+                placeholder="e.g., Wooden Chair"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="label" htmlFor="purchase-orders-f7">Image Link</label>
+            <input id="purchase-orders-f7"
+              type="url"
+              className="input"
+              value={quickProductForm.image_url}
+              onChange={e => setQuickProductForm({ ...quickProductForm, image_url: e.target.value })}
+              placeholder="https://example.com/image.jpg"
+            />
+            {quickProductForm.image_url && (
+              <img
+                src={quickProductForm.image_url}
+                alt="Preview"
+                className="h-20 w-20 object-cover rounded mt-2 border border-slate-200"
+                onError={e => ((e.target as HTMLImageElement).style.display = 'none')}
+              />
+            )}
+          </div>
+
+          <div>
+            <label className="label" htmlFor="purchase-orders-f8">Supplier *</label>
+            <select id="purchase-orders-f8"
+              className="input"
+              value={quickProductForm.supplier_id}
+              onChange={e => setQuickProductForm({ ...quickProductForm, supplier_id: e.target.value })}
+            >
+              <option value="">Select a supplier</option>
+              {suppliers.map(supplier => (
+                <option key={supplier.id} value={supplier.id}>
+                  {supplier.company_name || supplier.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="label" htmlFor="purchase-orders-f9">DP Rate (Cost)</label>
+              <input id="purchase-orders-f9"
+                type="number"
+                min="0"
+                step="0.01"
+                className="input"
+                value={quickProductForm.cost_price || ''}
+                onChange={e => setQuickProductForm({ ...quickProductForm, cost_price: Number(e.target.value) })}
+                placeholder="0.00"
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f10">Discount</label>
+              <input id="purchase-orders-f10"
+                type="number"
+                min="0"
+                step="0.01"
+                className="input"
+                value={quickProductForm.discount || ''}
+                onChange={e => setQuickProductForm({ ...quickProductForm, discount: Number(e.target.value) })}
+                placeholder="0.00"
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f11">MRP (Selling)</label>
+              <input id="purchase-orders-f11"
+                type="number"
+                min="0"
+                step="0.01"
+                className="input"
+                value={quickProductForm.selling_price || ''}
+                onChange={e => setQuickProductForm({ ...quickProductForm, selling_price: Number(e.target.value) })}
+                placeholder="0.00"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="label" htmlFor="purchase-orders-f12">Opening Qty</label>
+              <input id="purchase-orders-f12"
+                type="number"
+                min="0"
+                className="input"
+                value={quickProductForm.opening_qty || ''}
+                onChange={e => setQuickProductForm({ ...quickProductForm, opening_qty: Number(e.target.value) })}
+                placeholder="0"
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f13">Size</label>
+              <input id="purchase-orders-f13"
+                type="text"
+                className="input"
+                value={quickProductForm.size}
+                onChange={e => setQuickProductForm({ ...quickProductForm, size: e.target.value })}
+                placeholder="e.g., 45x50cm"
+              />
+            </div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f14">Weight</label>
+              <input id="purchase-orders-f14"
+                type="text"
+                className="input"
+                value={quickProductForm.weight}
+                onChange={e => setQuickProductForm({ ...quickProductForm, weight: e.target.value })}
+                placeholder="e.g., 5kg"
+              />
+            </div>
+          </div>
+
+          <div className="flex gap-2 pt-4">
+            <button onClick={handleAddProduct} className="btn-primary flex-1 justify-center">
+              <Plus size={16} /> Add Product
+            </button>
+            <button
+              onClick={() => {
+                setShowQuickAddProduct(false)
+                resetQuickProductForm()
+              }}
+              className="btn-secondary flex-1 justify-center"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={showReceiveModal} onClose={() => setShowReceiveModal(false)} title={t('purchase_receiveTitle')}>
+        {receiveItem && (
+          <div className="space-y-3">
+            <div className="p-3 bg-white rounded-xl text-sm">
+              <p className="font-medium">{receiveItem.product_name}</p>
+              <p className="text-slate-500 text-xs">{t('purchase_orderQty')} {receiveItem.qty} | {t('purchase_receivedQty')} {receiveItem.received_qty || 0}</p>
+            </div>
+            <div><label className="label" htmlFor="purchase-orders-f15">{t('purchase_receiveDate')}</label><input id="purchase-orders-f15" type="date" className="input" value={receiveForm.receive_date} onChange={e => setReceiveForm({ ...receiveForm, receive_date: e.target.value })} /></div>
+            <div><label className="label" htmlFor="purchase-orders-f16">{t('purchase_receiverName')}</label><input id="purchase-orders-f16" className="input" value={receiveForm.receiver_name} onChange={e => setReceiveForm({ ...receiveForm, receiver_name: e.target.value })} /></div>
+            <div><label className="label" htmlFor="purchase-orders-f17">{t('purchase_receivedQuantity')}</label><input id="purchase-orders-f17" type="number" min="1" max={receiveItem.qty - (receiveItem.received_qty || 0)} className="input" value={receiveForm.received_qty || ''} onChange={e => setReceiveForm({ ...receiveForm, received_qty: Number(e.target.value) })} /></div>
+            <div>
+              <label className="label" htmlFor="purchase-orders-f18">{t('purchase_condition')}</label>
+              <select id="purchase-orders-f18" className="input" value={receiveForm.condition} onChange={e => setReceiveForm({ ...receiveForm, condition: e.target.value })}>
+                <option value="good">{t('purchase_conditionGood')}</option>
+                <option value="damaged">{t('purchase_conditionDamaged')}</option>
+                <option value="partial">{t('purchase_conditionPartial')}</option>
+              </select>
+            </div>
+            <div><label className="label" htmlFor="purchase-orders-f19">{t('common_note')}</label><textarea id="purchase-orders-f19" className="input" rows={2} value={receiveForm.notes} onChange={e => setReceiveForm({ ...receiveForm, notes: e.target.value })} /></div>
+            <div className="flex gap-2 pt-2">
+              <button onClick={saveReceive} className="btn-primary flex-1 justify-center"><Truck size={16} /> {t('purchase_confirmReceive')}</button>
+              <button onClick={() => setShowReceiveModal(false)} className="btn-secondary flex-1 justify-center">{t('common_cancel')}</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal isOpen={showEditReceiveModal} onClose={() => setShowEditReceiveModal(false)} title="Edit Receiving" size="sm">
+        <div className="space-y-4">
+          <div>
+            <label className="label" htmlFor="purchase-orders-f20">Received Quantity</label>
+            <input id="purchase-orders-f20"
+              type="number"
+              min="0"
+              value={editReceiveQty}
+              onChange={e => setEditReceiveQty(Number(e.target.value))}
+              className="input"
+            />
+          </div>
+          <div className="flex gap-2 pt-2">
+            <button onClick={handleEditReceive} className="btn-primary flex-1 justify-center"><Edit2 size={16} /> Update</button>
+            <button onClick={() => setShowEditReceiveModal(false)} className="btn-secondary flex-1 justify-center">{t('common_cancel')}</button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={showEditPOModal} onClose={() => setShowEditPOModal(false)} title="Edit Purchase Order" size="sm">
+        <div className="space-y-4">
+          <div>
+            <label className="label" htmlFor="purchase-orders-f21">SI No</label>
+            <input id="purchase-orders-f21"
+              type="text"
+              value={editPOForm.si_no}
+              onChange={e => setEditPOForm({ ...editPOForm, si_no: e.target.value })}
+              className="input"
+            />
+          </div>
+          <div>
+            <label className="label" htmlFor="purchase-orders-f22">Date</label>
+            <input id="purchase-orders-f22"
+              type="date"
+              value={editPOForm.date}
+              onChange={e => setEditPOForm({ ...editPOForm, date: e.target.value })}
+              className="input"
+            />
+          </div>
+          <div>
+            <label className="label" htmlFor="purchase-orders-f23">Supplier</label>
+            <select id="purchase-orders-f23"
+              value={editPOForm.supplier_id}
+              onChange={e => setEditPOForm({ ...editPOForm, supplier_id: e.target.value })}
+              className="input"
+            >
+              <option value="">Select Supplier</option>
+              {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-2 pt-2">
+            <button onClick={saveEditPO} className="btn-primary flex-1 justify-center"><Save size={16} /> Update</button>
+            <button onClick={() => setShowEditPOModal(false)} className="btn-secondary flex-1 justify-center">{t('common_cancel')}</button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  )
+}

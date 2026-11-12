@@ -1,0 +1,443 @@
+import React, { useEffect, useMemo, useState } from 'react'
+import { CalendarDotsIcon as CalendarDays, EyeIcon as Eye, FileTextIcon as FileText, PencilSimpleIcon as Pencil, PlusIcon as Plus, ArrowsClockwiseIcon as RefreshCw, FloppyDiskIcon as Save, MagnifyingGlassIcon as Search, TrashIcon as Trash2, UsersIcon as Users, WalletIcon as WalletCards } from '@phosphor-icons/react'
+import PageHeader from '../../components/PageHeader'
+import TableScroller from '../../components/TableScroller'
+import Modal from '../../components/Modal'
+import { confirmAction } from '../../components/ConfirmDialog'
+import { supabase } from '../../lib/supabase'
+import { isMissingTableError } from '../../lib/supabaseErrors'
+import { migrateOtherIncomeFallbackRows, readOtherIncomeFallbackRows, sortOtherIncomeRows, writeOtherIncomeFallbackRows } from '../../lib/otherIncomeFallback'
+import { formatDate, todayISO } from '../../lib/utils'
+import { useAuth } from '../../context/AuthContext'
+import { useLang } from '../../context/LanguageContext'
+import toast from 'react-hot-toast'
+import { NoValue } from '../../components/CellValue'
+
+type IncomeType = 'supplier' | 'other'
+type DateFilter = 'all' | 'thisMonth' | 'custom'
+
+type OtherIncomeRow = {
+  id: string
+  date: string
+  income_type: IncomeType
+  supplier_id: string | null
+  supplier_name: string
+  source_name: string
+  amount: number
+  account_id: string
+  account_name: string
+  notes: string
+}
+
+const today = todayISO()
+
+function monthStart() {
+  const date = new Date()
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`
+}
+
+const emptyForm = {
+  date: today,
+  income_type: 'supplier' as IncomeType,
+  supplier_id: '',
+  source_name: '',
+  amount: 0,
+  account_id: '',
+  notes: '',
+}
+
+export default function OtherIncome() {
+  const { user } = useAuth()
+  const { formatCurr } = useLang()
+  const [rows, setRows] = useState<OtherIncomeRow[]>([])
+  const [suppliers, setSuppliers] = useState<any[]>([])
+  const [accounts, setAccounts] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [showModal, setShowModal] = useState(false)
+  const [viewItem, setViewItem] = useState<OtherIncomeRow | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [dateFilter, setDateFilter] = useState<DateFilter>('all')
+  const [typeFilter, setTypeFilter] = useState<'all' | IncomeType>('all')
+  const [accountFilter, setAccountFilter] = useState('all')
+  const [customStart, setCustomStart] = useState(monthStart())
+  const [customEnd, setCustomEnd] = useState(today)
+  const [form, setForm] = useState(emptyForm)
+  const [tableReady, setTableReady] = useState(true)
+
+  useEffect(() => { loadAll() }, [])
+
+  async function loadAll() {
+    setLoading(true)
+    const [incomeRes, supplierRes, accountRes] = await Promise.all([
+      supabase.from('other_incomes').select('*').order('date', { ascending: false }).order('created_at', { ascending: false }),
+      supabase.from('suppliers').select('id, name').eq('is_active', true).order('name'),
+      supabase.from('accounts').select('id, name').eq('is_active', true).order('sort_order'),
+    ])
+
+    const missingOtherIncomeTable = isMissingTableError(incomeRes.error, 'other_incomes')
+    setTableReady(!missingOtherIncomeTable)
+
+    if (incomeRes.error && !missingOtherIncomeTable) toast.error(incomeRes.error.message)
+    if (supplierRes.error) toast.error(supplierRes.error.message)
+    if (accountRes.error) toast.error(accountRes.error.message)
+
+    if (missingOtherIncomeTable) {
+      setRows(sortOtherIncomeRows(readOtherIncomeFallbackRows(user?.id)))
+      setSuppliers(supplierRes.data || [])
+      setAccounts(accountRes.data || [])
+      setLoading(false)
+      return
+    }
+
+    // The table answered, so anything still sitting in this browser from when the
+    // fallback was live is real income that never reached the server. Push it up
+    // and re-read, so it starts counting on every device instead of only this one.
+    let incomeRows = incomeRes.data || []
+    if (await migrateOtherIncomeFallbackRows(user?.id)) {
+      const retry = await supabase.from('other_incomes').select('*').order('date', { ascending: false }).order('created_at', { ascending: false })
+      if (!retry.error) incomeRows = retry.data || []
+      toast.success('Moved other income saved on this device up to your account')
+    }
+
+    setRows(incomeRows.map((item: any) => ({ ...item, amount: Number(item.amount || 0) })))
+    setSuppliers(supplierRes.data || [])
+    setAccounts(accountRes.data || [])
+    setLoading(false)
+  }
+
+  function resetForm() {
+    setEditingId(null)
+    setForm(emptyForm)
+  }
+
+  function openNew() {
+    resetForm()
+    setShowModal(true)
+  }
+
+  function openEdit(item: OtherIncomeRow) {
+    setEditingId(item.id)
+    setForm({
+      date: item.date || today,
+      income_type: item.income_type,
+      supplier_id: item.supplier_id || '',
+      source_name: item.source_name || '',
+      amount: Number(item.amount || 0),
+      account_id: item.account_id || '',
+      notes: item.notes || '',
+    })
+    setShowModal(true)
+  }
+
+  async function save() {
+    if (!form.date || !form.account_id || !form.amount || form.amount <= 0) {
+      toast.error('Please fill all required fields')
+      return
+    }
+    if (form.income_type === 'supplier' && !form.supplier_id) {
+      toast.error('Please select supplier')
+      return
+    }
+    if (form.income_type === 'other' && !form.source_name.trim()) {
+      toast.error('Please enter source name')
+      return
+    }
+
+    const supplier = suppliers.find(item => item.id === form.supplier_id)
+    const account = accounts.find(item => item.id === form.account_id)
+    const payload = {
+      date: form.date,
+      income_type: form.income_type,
+      supplier_id: form.income_type === 'supplier' ? form.supplier_id : null,
+      supplier_name: form.income_type === 'supplier' ? supplier?.name || '' : '',
+      source_name: form.income_type === 'other' ? form.source_name.trim() : '',
+      amount: form.amount,
+      account_id: form.account_id,
+      account_name: account?.name || '',
+      notes: form.notes,
+    }
+
+    // No local fallback on the way in any more. It used to write the row to
+    // localStorage and show a green "Other income saved", so income the server
+    // had rejected read as recorded - and it then fed the Monthly Report, the
+    // Yearly Report, the Report Summary and the Shareholder Dashboard, giving a
+    // different profit per browser. If a save cannot reach the server the
+    // operator has to see that.
+    const result = editingId
+      ? await supabase.from('other_incomes').update(payload).eq('id', editingId)
+      : await supabase.from('other_incomes').insert({ ...payload, created_by: user?.id })
+
+    if (result.error) {
+      toast.error(result.error.message || 'Could not save other income')
+      return
+    }
+
+    toast.success(editingId ? 'Other income updated' : 'Other income saved')
+    setShowModal(false)
+    resetForm()
+    await loadAll()
+  }
+
+  async function deleteItem(item: OtherIncomeRow) {
+    if (!(await confirmAction({ message: 'Delete this other income transaction?' }))) return
+
+    // A row whose id is local never reached the server, so there is nothing to
+    // delete there - only the browser copy. Every other row goes to the server,
+    // and a failure is reported rather than faked.
+    if (!tableReady || item.id.startsWith('local-')) {
+      const nextRows = readOtherIncomeFallbackRows(user?.id).filter(row => row.id !== item.id)
+      writeOtherIncomeFallbackRows(user?.id, nextRows)
+      setRows(current => current.filter(row => row.id !== item.id))
+      toast.success('Other income deleted')
+      return
+    }
+
+    const { error } = await supabase.from('other_incomes').delete().eq('id', item.id)
+    if (error) {
+      toast.error(error.message || 'Could not delete other income')
+      return
+    }
+    toast.success('Other income deleted')
+    await loadAll()
+  }
+
+  function resetFilters() {
+    setSearch('')
+    setDateFilter('all')
+    setTypeFilter('all')
+    setAccountFilter('all')
+    setCustomStart(monthStart())
+    setCustomEnd(today)
+  }
+
+  const filteredRows = useMemo(() => {
+    const needle = search.trim().toLowerCase()
+    return rows.filter(row => {
+      const source = row.income_type === 'supplier' ? row.supplier_name : row.source_name
+      const matchesSearch = !needle || [source, row.notes, row.account_name].some(value => (value || '').toLowerCase().includes(needle))
+      const matchesType = typeFilter === 'all' || row.income_type === typeFilter
+      const matchesAccount = accountFilter === 'all' || row.account_id === accountFilter
+      const matchesDate = dateFilter === 'all'
+        || (dateFilter === 'thisMonth' && row.date >= monthStart() && row.date <= today)
+        || (dateFilter === 'custom' && row.date >= customStart && row.date <= customEnd)
+      return matchesSearch && matchesType && matchesAccount && matchesDate
+    })
+  }, [rows, search, dateFilter, typeFilter, accountFilter, customStart, customEnd])
+
+  const totals = useMemo(() => {
+    const total = filteredRows.reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    const supplier = filteredRows.filter(item => item.income_type === 'supplier').reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    const other = filteredRows.filter(item => item.income_type === 'other').reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    return { total, supplier, other, count: filteredRows.length }
+  }, [filteredRows])
+
+  return (
+    <div className="min-h-full bg-white p-6">
+      <PageHeader
+        title="Others Income"
+        subtitle="Supplier commission and other income received"
+        actions={
+          <button
+            onClick={openNew}
+            className="btn-primary"
+          >
+            <Plus size={16} /> New Transaction
+          </button>
+        }
+      />
+
+      <div className="mb-5 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <SummaryCard title="Total Others Income" value={formatCurr(totals.total)} subtitle="Selected range" icon={<WalletCards size={24} />} tone="blue" />
+        <SummaryCard title="Supplier Commission" value={formatCurr(totals.supplier)} subtitle="Selected range" icon={<Users size={24} />} tone="green" />
+        <SummaryCard title="Other Source Income" value={formatCurr(totals.other)} subtitle="Selected range" icon={<FileText size={24} />} tone="orange" />
+        <SummaryCard title="Total Transactions" value={String(totals.count)} subtitle="Selected range" icon={<FileText size={24} />} tone="purple" />
+      </div>
+
+      <section className="card overflow-hidden p-0">
+        <div className="border-b border-slate-100 p-4">
+          <h2 className="text-base font-bold text-slate-800">Others Income List</h2>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 border-b border-slate-100 p-4 lg:grid-cols-[minmax(220px,1fr)_160px_150px_170px_auto]">
+          <div className="relative">
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input className="input pl-9" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by supplier / source / note..." />
+          </div>
+          <select className="input" value={dateFilter} onChange={e => setDateFilter(e.target.value as DateFilter)}>
+            <option value="all">All Date</option>
+            <option value="thisMonth">This Month</option>
+            <option value="custom">Date Range</option>
+          </select>
+          <select className="input" value={typeFilter} onChange={e => setTypeFilter(e.target.value as 'all' | IncomeType)}>
+            <option value="all">All Type</option>
+            <option value="supplier">Supplier</option>
+            <option value="other">Others</option>
+          </select>
+          <select className="input" value={accountFilter} onChange={e => setAccountFilter(e.target.value)}>
+            <option value="all">All Account</option>
+            {accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}
+          </select>
+          <button onClick={resetFilters} className="btn-secondary justify-center"><RefreshCw size={15} /> Reset</button>
+          {dateFilter === 'custom' && (
+            <div className="grid grid-cols-1 gap-3 lg:col-span-5 sm:grid-cols-2">
+              <div className="relative">
+                <CalendarDays size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input type="date" className="input pl-9" value={customStart} onChange={e => setCustomStart(e.target.value)} />
+              </div>
+              <div className="relative">
+                <CalendarDays size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input type="date" className="input pl-9" value={customEnd} min={customStart} onChange={e => setCustomEnd(e.target.value)} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        <TableScroller className="overflow-x-auto">
+          <table className="w-full min-w-[980px] text-sm">
+            <thead className="table-header">
+              <tr>
+                <th className="px-4 py-3 text-left w-12">#</th>
+                <th className="px-4 py-3 text-left">Date</th>
+                <th className="px-4 py-3 text-left">Type</th>
+                <th className="px-4 py-3 text-left">Supplier / Source</th>
+                <th className="px-4 py-3 text-right">Amount</th>
+                <th className="px-4 py-3 text-left">Account</th>
+                <th className="px-4 py-3 text-left">Note</th>
+                <th className="px-4 py-3 text-center">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr><td colSpan={8} className="px-4 py-10 text-center text-slate-400">Loading...</td></tr>
+              ) : filteredRows.length === 0 ? (
+                <tr><td colSpan={8} className="px-4 py-10 text-center text-slate-400">No income records found</td></tr>
+              ) : filteredRows.map((item, index) => (
+                <tr key={item.id} className="table-row">
+                  <td className="px-4 py-3 text-slate-500">{index + 1}</td>
+                  <td className="px-4 py-3 whitespace-nowrap">{formatDate(item.date)}</td>
+                  <td className="px-4 py-3">
+                    <span className={item.income_type === 'supplier' ? 'badge-green' : 'badge-orange'}>
+                      {item.income_type === 'supplier' ? 'Supplier' : 'Others'}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 font-semibold text-slate-700">{item.income_type === 'supplier' ? item.supplier_name : item.source_name}</td>
+                  <td className="px-4 py-3 text-right font-bold text-brand-green">{formatCurr(Number(item.amount || 0))}</td>
+                  <td className="px-4 py-3 text-slate-500">{item.account_name}</td>
+                  <td className="px-4 py-3 text-slate-400">{item.notes || <NoValue />}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-center gap-2">
+                      <button onClick={() => setViewItem(item)} className="rounded-lg bg-slate-100 p-1.5 text-slate-600 hover:bg-slate-200" title="View"><Eye size={15} /></button>
+                      <button onClick={() => openEdit(item)} className="rounded-lg p-1.5 text-neutral-500 hover:bg-neutral-100 hover:text-navy-900" title="Edit"><Pencil size={15} /></button>
+                      <button onClick={() => deleteItem(item)} className="rounded-lg bg-red-50 p-1.5 text-brand-red hover:bg-red-100" title="Delete"><Trash2 size={15} /></button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </TableScroller>
+        <div className="border-t border-slate-100 px-4 py-3 text-xs font-medium text-slate-500">
+          Showing {filteredRows.length} of {rows.length} transactions
+        </div>
+      </section>
+
+      <Modal isOpen={showModal} onClose={() => { setShowModal(false); resetForm() }} title={editingId ? 'Edit Transaction' : 'New Transaction'} size="xl">
+        <div className="grid gap-5">
+          <div className="grid gap-4 md:grid-cols-2">
+            <div>
+              <label className="label" htmlFor="other-income-f1">Date <span className="text-brand-red">*</span></label>
+              <input id="other-income-f1" type="date" className="input" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} />
+            </div>
+            <div>
+              <label className="label" htmlFor="other-income-f2">Type <span className="text-brand-red">*</span></label>
+              <select id="other-income-f2" className="input" value={form.income_type} onChange={e => setForm({ ...form, income_type: e.target.value as IncomeType, supplier_id: '', source_name: '' })}>
+                <option value="supplier">Supplier</option>
+                <option value="other">Others</option>
+              </select>
+            </div>
+            {form.income_type === 'supplier' ? (
+              <div>
+                <label className="label" htmlFor="other-income-f3">Supplier <span className="text-brand-red">*</span></label>
+                <select id="other-income-f3" className="input" value={form.supplier_id} onChange={e => setForm({ ...form, supplier_id: e.target.value })}>
+                  <option value="">Select Supplier</option>
+                  {suppliers.map(supplier => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}
+                </select>
+              </div>
+            ) : (
+              <div>
+                <label className="label" htmlFor="other-income-f4">Source <span className="text-brand-red">*</span></label>
+                <input id="other-income-f4" className="input" value={form.source_name} onChange={e => setForm({ ...form, source_name: e.target.value })} placeholder="Enter income source" />
+              </div>
+            )}
+            <div>
+              <label className="label" htmlFor="other-income-f5">Amount <span className="text-brand-red">*</span></label>
+              <input id="other-income-f5" type="number" min="0" className="input" value={form.amount || ''} onChange={e => setForm({ ...form, amount: Number(e.target.value) })} placeholder="Enter amount" />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label" htmlFor="other-income-f6">Receiving Account <span className="text-brand-red">*</span></label>
+              <select id="other-income-f6" className="input" value={form.account_id} onChange={e => setForm({ ...form, account_id: e.target.value })}>
+                <option value="">Select Account</option>
+                {accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}
+              </select>
+            </div>
+            <div className="md:col-span-2">
+              <label className="label" htmlFor="other-income-f7">Notes</label>
+              <textarea id="other-income-f7" className="input min-h-[92px]" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} placeholder="Enter notes (optional)" />
+            </div>
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2 border-t border-slate-100 pt-4">
+          <button onClick={() => { setShowModal(false); resetForm() }} className="btn-secondary">Cancel</button>
+          <button onClick={save} className="btn-primary"><Save size={16} /> Save Transaction</button>
+        </div>
+      </Modal>
+
+      <Modal isOpen={!!viewItem} onClose={() => setViewItem(null)} title="Transaction Details">
+        {viewItem && (
+          <div className="space-y-3 text-sm">
+            <Detail label="Date" value={formatDate(viewItem.date)} />
+            <Detail label="Type" value={viewItem.income_type === 'supplier' ? 'Supplier' : 'Others'} />
+            <Detail label="Supplier / Source" value={viewItem.income_type === 'supplier' ? viewItem.supplier_name : viewItem.source_name} />
+            <Detail label="Amount" value={formatCurr(Number(viewItem.amount || 0))} />
+            <Detail label="Account" value={viewItem.account_name} />
+            <Detail label="Note" value={viewItem.notes || '-'} />
+          </div>
+        )}
+      </Modal>
+    </div>
+  )
+}
+
+function SummaryCard({ title, value, subtitle, icon, tone }: { title: string; value: string; subtitle: string; icon: React.ReactNode; tone: 'blue' | 'green' | 'orange' | 'purple' }) {
+  const tones = {
+    blue: 'border-slate-200 bg-white text-slate-700',
+    green: 'border-green-100 bg-green-50/60 text-brand-green',
+    orange: 'border-brand-blue/20 bg-brand-blue-soft/60 text-brand-blue',
+    purple: 'border-slate-200 bg-white text-slate-700',
+  }
+
+  return (
+    <section className={`rounded-lg border bg-white p-5 shadow-sm ${tones[tone]}`}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-xs font-bold">{title}</p>
+          <p className="mt-2 break-words text-2xl font-black tabular-nums text-slate-900">{value}</p>
+          <p className="mt-2 text-xs font-medium text-slate-500">{subtitle}</p>
+        </div>
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-white/80">
+          {icon}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-4 rounded-lg bg-white px-3 py-2">
+      <span className="text-slate-500">{label}</span>
+      <span className="text-right font-semibold text-slate-800">{value}</span>
+    </div>
+  )
+}

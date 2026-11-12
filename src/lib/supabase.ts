@@ -1,0 +1,445 @@
+// Supabase-compatible data layer backed by our Express API.
+//
+// The original app talked to Supabase directly from every page:
+//   const { data, error } = await supabase.from('sales').select('*').eq(...)
+// To keep all page/UI code untouched, this module re-implements the small
+// subset of the supabase-js query builder the app actually uses and routes
+// it to the REST backend. Complex transactional flows (sale save, purchase
+// receive, FIFO) do NOT go through here - pages call the services directly.
+
+import { api } from './httpClient'
+import { consumeRecycleMeta } from './recycleBin'
+import { isForbidden, noticeForbidden } from './accessNotice'
+// One home for what a query means - see queryEngine.ts and its tests.
+import { applyFilters, applyOrder, applyRange, type Filter, type Row } from './queryEngine'
+
+interface TableConfig {
+  list: string            // GET endpoint returning all rows for this owner
+  create?: string         // POST endpoint (single row)
+  update?: (id: string) => string  // PATCH endpoint
+  remove?: (id: string) => string  // DELETE endpoint
+  upsertPut?: string      // PUT endpoint for upsert-style tables
+  flattenFrom?: { list: string; key: string } // derive rows from a parent list
+  // Which column a gte/lte can be handed to the server as ?from=&to=. Only set
+  // it where the endpoint actually understands those, and only for a real date
+  // column - see buildListQuery below for why this can only ever widen.
+  dateColumn?: string
+}
+
+const TABLES: Record<string, TableConfig> = {
+  business_settings: { list: '/business-settings', upsertPut: '/business-settings' },
+  shareholders: { list: '/shareholders', create: '/shareholders', update: (id) => `/shareholders/${id}`, remove: (id) => `/shareholders/${id}` },
+  accounts: { list: '/accounts', create: '/accounts', update: (id) => `/accounts/${id}`, remove: (id) => `/accounts/${id}` },
+  account_transfers: { list: '/account-transfers', dateColumn: 'date', create: '/account-transfers', update: (id) => `/account-transfers/${id}`, remove: (id) => `/account-transfers/${id}` },
+  monthly_targets: { list: '/monthly-targets', upsertPut: '/monthly-targets', update: (id) => `/monthly-targets/${id}`, remove: (id) => `/monthly-targets/${id}` },
+  purchase_targets: { list: '/purchase-targets', create: '/purchase-targets', update: (id) => `/purchase-targets/${id}`, remove: (id) => `/purchase-targets/${id}` },
+  expense_categories: { list: '/expense-categories', create: '/expense-categories', update: (id) => `/expense-categories/${id}`, remove: (id) => `/expense-categories/${id}` },
+  suppliers: { list: '/suppliers', create: '/suppliers', update: (id) => `/suppliers/${id}`, remove: (id) => `/suppliers/${id}` },
+  customers: { list: '/customers', create: '/customers', update: (id) => `/customers/${id}`, remove: (id) => `/customers/${id}` },
+  products: { list: '/products', create: '/products', update: (id) => `/products/${id}`, remove: (id) => `/products/${id}` },
+  investments: { list: '/investments', dateColumn: 'date', create: '/investments', update: (id) => `/investments/${id}`, remove: (id) => `/investments/${id}` },
+  profit_withdrawals: { list: '/profit-withdrawals', dateColumn: 'date', create: '/profit-withdrawals', update: (id) => `/profit-withdrawals/${id}`, remove: (id) => `/profit-withdrawals/${id}` },
+  loans: { list: '/loans', dateColumn: 'date', create: '/loans', update: (id) => `/loans/${id}`, remove: (id) => `/loans/${id}` },
+  loan_lenders: { list: '/loan-lenders', create: '/loan-lenders', update: (id) => `/loan-lenders/${id}`, remove: (id) => `/loan-lenders/${id}` },
+  expenses: { list: '/expenses', dateColumn: 'date', create: '/expenses', update: (id) => `/expenses/${id}`, remove: (id) => `/expenses/${id}` },
+  other_incomes: { list: '/other-incomes', dateColumn: 'date', create: '/other-incomes', update: (id) => `/other-incomes/${id}`, remove: (id) => `/other-incomes/${id}` },
+  purchases: { list: '/purchases', dateColumn: 'date', update: (id) => `/purchases/${id}`, remove: (id) => `/purchases/${id}` },
+  purchase_items: { list: '', flattenFrom: { list: '/purchases', key: 'purchase_items' }, update: (id) => `/purchases/items/${id}`, remove: (id) => `/purchases/items/${id}` },
+  purchase_receives: { list: '', flattenFrom: { list: '/purchases', key: 'purchase_receives' } },
+  supplier_payments: { list: '/supplier-payments', dateColumn: 'date', create: '/supplier-payments', update: (id) => `/supplier-payments/${id}`, remove: (id) => `/supplier-payments/${id}` },
+  inventory: { list: '/inventory' },
+  inventory_history: { list: '/inventory/history' },
+  inventory_batches: { list: '/inventory/batches' },
+  sales: { list: '/sales', dateColumn: 'date', update: (id) => `/sales/${id}`, remove: (id) => `/sales/${id}` },
+  sale_items: { list: '', flattenFrom: { list: '/sales', key: 'sale_items' } },
+  sale_deliveries: { list: '', flattenFrom: { list: '/sales', key: 'sale_deliveries' } },
+  sale_payments: { list: '/sale-payments', dateColumn: 'date', create: '/sale-payments', update: (id) => `/sale-payments/${id}`, remove: (id) => `/sale-payments/${id}` },
+  customer_payments: { list: '/customer-payments', dateColumn: 'date', create: '/customer-payments', update: (id) => `/customer-payments/${id}`, remove: (id) => `/customer-payments/${id}` },
+  employees: { list: '/employees', create: '/employees', update: (id) => `/employees/${id}`, remove: (id) => `/employees/${id}` },
+  salary_transactions: { list: '/salary-transactions', create: '/salary-transactions', update: (id) => `/salary-transactions/${id}`, remove: (id) => `/salary-transactions/${id}` },
+  attendance: { list: '/attendance', upsertPut: '/attendance', update: (id) => `/attendance/${id}`, remove: (id) => `/attendance/${id}` },
+  marketing_contacts: { list: '/marketing-contacts', create: '/marketing-contacts', update: (id) => `/marketing-contacts/${id}`, remove: (id) => `/marketing-contacts/${id}` },
+  owner_subscriptions: { list: '/subscriptions/my' },
+  // Team profiles (owner-only endpoint; other roles degrade to an empty list).
+  profiles: { list: '/users/list' },
+}
+
+interface QueryState {
+  table: string
+  action: 'select' | 'insert' | 'update' | 'upsert' | 'delete'
+  payload?: any
+  filters: Filter[]
+  orders: { column: string; ascending: boolean }[]
+  limitCount?: number
+  rangeFrom?: number
+  single: boolean
+  maybe: boolean
+  wantsReturn: boolean
+}
+
+// Every query here fetches a whole table and then filters in the browser, and
+// a page load asks for the same table several times over: Sales reads `sales`
+// six times, plus `sale_items` and `sale_deliveries`, which are not tables at
+// all - they are flattened out of that same /sales response. That was nine
+// full downloads of the sales list to paint one screen.
+//
+// So identical GETs that overlap share one request, and a result stays usable
+// for a moment afterwards to cover the calls that follow rather than run
+// alongside. The window is deliberately tiny, and ANY write clears the lot -
+// a read must never answer with data from before a save the user just made.
+// Keyed by the URL actually requested, not the table name. Two things follow
+// from that: `sale_items` and `sales` are one download rather than two (they
+// are the same /sales response, flattened differently), and the same table
+// asked for over two different date ranges is correctly two entries.
+//
+// 5s rather than the 600ms it started at: 600ms only covered calls made in the
+// same Promise.all, and the sequences that repeat a table - fetch, then patch,
+// then read it back - routinely run longer than that.
+const HTTP_CACHE_MS = 5000
+const pending = new Map<string, Promise<Row[]>>()
+const recent = new Map<string, { at: number; rows: Row[] }>()
+
+export function invalidateTableCache() {
+  pending.clear()
+  recent.clear()
+}
+
+// Every write drops the whole cache, whichever route it took. The note at the
+// top of this file is the reason this hangs off the shared axios instance
+// rather than off runQuery: the transactional flows - saving a sale, receiving
+// a purchase, recording a delivery - never come through this layer at all, and
+// a read after one of those must not answer from before it. Clearing all
+// tables rather than the one written is deliberate; a sale moves stock and a
+// customer balance too, and one extra fetch costs far less than showing a
+// figure the user just changed.
+api.interceptors.response.use((response) => {
+  if ((response.config.method || 'get').toLowerCase() !== 'get') invalidateTableCache()
+  return response
+})
+
+// A plain YYYY-MM-DD, which is the only shape the server accepts. Values that
+// carry a time are cut back to the day, which widens the range rather than
+// narrowing it - see below for why that direction is the safe one.
+const asServerDate = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined
+  const day = value.slice(0, 10)
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined
+}
+
+// Turns the date bounds already captured on the query into ?from=&to=.
+//
+// This is the whole point of the change: the browser used to download every
+// row the account has ever had and then throw away everything outside the
+// month on screen. Now the server is told the range.
+//
+// It deliberately only ever WIDENS what the server sends back:
+//   - a bound is only pushed for the table's own date column
+//   - `gt`/`lt` are exclusive but go out as inclusive from/to
+//   - a timestamp is cut back to its day
+// queryEngine then applies the very same filters again, unchanged, over the
+// response. So the server narrows and the browser still decides, which is the
+// contract written at the top of queryEngine.ts. Anything unrecognised is
+// simply not pushed, and that table behaves exactly as it did before.
+export function buildListQuery(config: TableConfig, filters: Filter[]): string {
+  if (!config.dateColumn) return ''
+
+  const params = new URLSearchParams()
+  for (const filter of filters) {
+    if (!('column' in filter) || filter.column !== config.dateColumn) continue
+    if (filter.kind !== 'gte' && filter.kind !== 'gt' && filter.kind !== 'lte' && filter.kind !== 'lt') continue
+
+    const day = asServerDate(filter.value)
+    if (!day) continue
+    params.set(filter.kind === 'gte' || filter.kind === 'gt' ? 'from' : 'to', day)
+  }
+  return params.toString()
+}
+
+async function fetchRows(table: string, filters: Filter[] = []): Promise<Row[]> {
+  const config = TABLES[table]
+  if (!config) throw new Error(`Table not supported by API layer: ${table}`)
+
+  // Pseudo-tables read the parent endpoint, so they share its cache entry.
+  const endpoint = config.flattenFrom ? config.flattenFrom.list : config.list
+  const query = buildListQuery(config, filters)
+  const url = query ? `${endpoint}?${query}` : endpoint
+
+  const parents = await fetchUrl(url)
+
+  if (!config.flattenFrom) return parents
+  if (config.flattenFrom.key === 'purchase_receives') {
+    return parents.flatMap((parent) =>
+      (parent.purchase_items || []).flatMap((item: Row) => item.purchase_receives || []))
+  }
+  return parents.flatMap((parent) => parent[config.flattenFrom!.key] || [])
+}
+
+async function fetchUrl(url: string): Promise<Row[]> {
+  const fresh = recent.get(url)
+  if (fresh && Date.now() - fresh.at < HTTP_CACHE_MS) return fresh.rows
+
+  const inFlight = pending.get(url)
+  if (inFlight) return inFlight
+
+  const request = api.get(url)
+    .then((response) => {
+      const data = response.data.data
+      // Single-object endpoints (business_settings, owner_subscriptions).
+      const rows: Row[] = data && !Array.isArray(data) ? [data] : (data || [])
+      recent.set(url, { at: Date.now(), rows })
+      return rows
+    })
+    .finally(() => {
+      pending.delete(url)
+    })
+
+  pending.set(url, request)
+  return request
+}
+
+async function runQuery(state: QueryState): Promise<{ data: any; error: any; count?: number }> {
+  const config = TABLES[state.table]
+
+  try {
+    if (!config) throw new Error(`Table not supported by API layer: ${state.table}`)
+
+    if (state.action === 'select') {
+      let rows = applyFilters(await fetchRows(state.table, state.filters), state.filters)
+      rows = applyOrder(rows, state.orders)
+      rows = applyRange(rows, state.rangeFrom, state.limitCount)
+      if (state.single || state.maybe) {
+        return { data: rows[0] ?? null, error: state.single && rows.length === 0 ? { message: 'Row not found' } : null }
+      }
+      return { data: rows, error: null, count: rows.length }
+    }
+
+    if (state.action === 'insert') {
+      const payloads: Row[] = Array.isArray(state.payload) ? state.payload : [state.payload]
+      const endpoint = config.create ?? config.upsertPut
+      if (!endpoint) throw new Error(`Insert not supported for table: ${state.table}`)
+      const created: Row[] = []
+      for (const payload of payloads) {
+        const response = config.create
+          ? await api.post(endpoint, payload)
+          : await api.put(endpoint, payload)
+        created.push(response.data.data)
+      }
+      const data = Array.isArray(state.payload) ? created : created[0]
+      return { data: state.wantsReturn ? data : null, error: null }
+    }
+
+    if (state.action === 'upsert') {
+      const payloads: Row[] = Array.isArray(state.payload) ? state.payload : [state.payload]
+      const saved: Row[] = []
+      if (state.table === 'products') {
+        const response = await api.post('/products/bulk-upsert', { products: payloads })
+        return { data: state.wantsReturn ? response.data.data : null, error: null }
+      }
+      if (!config.upsertPut) throw new Error(`Upsert not supported for table: ${state.table}`)
+      for (const payload of payloads) {
+        const response = await api.put(config.upsertPut, payload)
+        saved.push(response.data.data)
+      }
+      const data = Array.isArray(state.payload) ? saved : saved[0]
+      return { data: state.wantsReturn ? data : null, error: null }
+    }
+
+    if (state.action === 'update') {
+      const idFilter = state.filters.find((f) => f.kind === 'eq' && f.column === 'id') as { value: string } | undefined
+
+      // Upsert-only tables (business_settings) have a single PUT endpoint that
+      // upserts by owner - no per-id PATCH exists. Route every update there,
+      // whether or not an .eq('id', ...) filter was supplied (the backend
+      // ignores the id and keys off owner_id). Tables that ALSO have a real
+      // per-id update endpoint (monthly_targets, attendance) only take the PUT
+      // path when no id filter is present; with an id they PATCH below.
+      if (config.upsertPut && (!idFilter || !config.update)) {
+        const response = await api.put(config.upsertPut, state.payload)
+        return { data: state.wantsReturn ? response.data.data : null, error: null }
+      }
+
+      if (!config.update) throw new Error(`Update not supported for table: ${state.table}`)
+      if (idFilter) {
+        const response = await api.patch(config.update(idFilter.value), state.payload)
+        return { data: state.wantsReturn ? response.data.data : null, error: null }
+      }
+      // Update by non-id filters: resolve ids first, then patch each.
+      const rows = applyFilters(await fetchRows(state.table, state.filters), state.filters)
+      const updated: Row[] = []
+      for (const row of rows) {
+        const response = await api.patch(config.update(row.id), state.payload)
+        updated.push(response.data.data)
+      }
+      return { data: state.wantsReturn ? updated : null, error: null }
+    }
+
+    if (state.action === 'delete') {
+      if (!config.remove) throw new Error(`Delete not supported for table: ${state.table}`)
+      const idFilter = state.filters.find((f) => f.kind === 'eq' && f.column === 'id') as { value: string } | undefined
+      const ids: string[] = idFilter
+        ? [idFilter.value]
+        : applyFilters(await fetchRows(state.table, state.filters), state.filters).map((row) => row.id)
+      for (const id of ids) {
+        const recycle = consumeRecycleMeta(state.table, id)
+        await api.delete(config.remove(id), recycle ? { data: { recycle } } : undefined)
+      }
+      return { data: null, error: null }
+    }
+
+    throw new Error(`Unsupported action: ${state.action}`)
+  } catch (error: any) {
+    const message = error?.response?.data?.message || error?.message || 'Request failed'
+    const code = error?.response?.status
+    // The one failure that must not stay silent. Every caller here ignores
+    // `error` and renders `data`, so without this a refusal is indistinguishable
+    // from an empty table - see accessNotice.ts for why that went unnoticed for
+    // months on the Sales page.
+    if (isForbidden(code)) noticeForbidden(state.table, message)
+    return { data: state.single || state.maybe ? null : [], error: { message, code } }
+  }
+}
+
+class QueryBuilder implements PromiseLike<{ data: any; error: any; count?: number }> {
+  private state: QueryState
+
+  constructor(table: string) {
+    this.state = { table, action: 'select', filters: [], orders: [], single: false, maybe: false, wantsReturn: false }
+  }
+
+  select(_columns?: string, _options?: any) {
+    if (this.state.action === 'select') this.state.action = 'select'
+    this.state.wantsReturn = true
+    return this
+  }
+
+  insert(payload: any) { this.state.action = 'insert'; this.state.payload = payload; return this }
+  upsert(payload: any, _options?: any) { this.state.action = 'upsert'; this.state.payload = payload; return this }
+  update(payload: any) { this.state.action = 'update'; this.state.payload = payload; return this }
+  delete() { this.state.action = 'delete'; return this }
+
+  eq(column: string, value: any) { this.state.filters.push({ kind: 'eq', column, value }); return this }
+  neq(column: string, value: any) { this.state.filters.push({ kind: 'neq', column, value }); return this }
+  in(column: string, values: any[]) { this.state.filters.push({ kind: 'in', column, values }); return this }
+  gt(column: string, value: any) { this.state.filters.push({ kind: 'gt', column, value }); return this }
+  gte(column: string, value: any) { this.state.filters.push({ kind: 'gte', column, value }); return this }
+  lt(column: string, value: any) { this.state.filters.push({ kind: 'lt', column, value }); return this }
+  lte(column: string, value: any) { this.state.filters.push({ kind: 'lte', column, value }); return this }
+  is(column: string, value: any) { this.state.filters.push({ kind: 'is', column, value }); return this }
+  not(column: string, operator: string, value: any) {
+    if (operator === 'is') this.state.filters.push({ kind: 'not_is', column, value })
+    return this
+  }
+  ilike(column: string, pattern: string) { this.state.filters.push({ kind: 'ilike', column, pattern }); return this }
+
+  order(column: string, options?: { ascending?: boolean }) {
+    this.state.orders.push({ column, ascending: options?.ascending !== false })
+    return this
+  }
+  limit(count: number) { this.state.limitCount = count; return this }
+  // Both ends matter. Setting only a limit ignored `from`, so every "next
+  // page" came back starting at row 0 - each page a superset of the last. A
+  // caller looping until it saw a short page therefore never stopped once a
+  // table held more rows than the page size.
+  range(from: number, to: number) { this.state.rangeFrom = from; this.state.limitCount = to + 1; return this }
+
+  single() { this.state.single = true; return this }
+  maybeSingle() { this.state.maybe = true; return this }
+
+  then<TResult1 = any, TResult2 = never>(
+    onfulfilled?: ((value: { data: any; error: any; count?: number }) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+  ): PromiseLike<TResult1 | TResult2> {
+    return runQuery(this.state).then(onfulfilled, onrejected)
+  }
+}
+
+// Auth surface kept for any stragglers - the app should use AuthContext,
+// but a page calling supabase.auth.getSession() won't crash.
+const authShim = {
+  async getSession() {
+    return { data: { session: null }, error: null }
+  },
+  async getUser() {
+    return { data: { user: null }, error: null }
+  },
+  async signOut() {
+    return { error: null }
+  },
+}
+
+// Supabase realtime pushed table changes to subscribed pages so they could
+// auto-reload. We deliberately do NOT poll on a timer - a fixed-interval
+// refetch made pages visibly re-load every few seconds (each callback ran
+// loadData -> setLoading(true) -> flicker), which was more annoying than
+// useful for a single-tenant admin app. Instead we refresh when the browser
+// tab regains focus/visibility: no reload while you're actively working, but
+// data is refreshed when you come back to it.
+class ChannelShim {
+  private callbacks: Array<() => void> = []
+  // Dedupe by the original handler reference - a page often registers the same
+  // loadData for several tables (.on(loans) .on(accounts) ...); without this
+  // one focus event would fire it once per table.
+  private rawHandlers = new Set<unknown>()
+  private onWake: (() => void) | null = null
+
+  on(_event: string, _filter: any, callback?: any) {
+    const handler = typeof _filter === 'function' ? _filter : callback
+    if (typeof handler === 'function' && !this.rawHandlers.has(handler)) {
+      this.rawHandlers.add(handler)
+      this.callbacks.push(() => {
+        try {
+          handler({})
+        } catch {
+          // A failing page callback must not break the refresh loop.
+        }
+      })
+    }
+    return this
+  }
+
+  subscribe(_callback?: any) {
+    if (!this.onWake && this.callbacks.length > 0) {
+      let scheduled = false
+      this.onWake = () => {
+        if (document.visibilityState === 'hidden') return
+        // Collapse the focus + visibilitychange burst into a single refresh.
+        if (scheduled) return
+        scheduled = true
+        setTimeout(() => {
+          scheduled = false
+          this.callbacks.forEach(cb => cb())
+        }, 0)
+      }
+      window.addEventListener('focus', this.onWake)
+      document.addEventListener('visibilitychange', this.onWake)
+    }
+    return this
+  }
+
+  unsubscribe() {
+    if (this.onWake) {
+      window.removeEventListener('focus', this.onWake)
+      document.removeEventListener('visibilitychange', this.onWake)
+      this.onWake = null
+    }
+    this.callbacks = []
+    this.rawHandlers.clear()
+    return Promise.resolve('ok')
+  }
+}
+
+export const supabase = {
+  from(table: string) {
+    return new QueryBuilder(table)
+  },
+  auth: authShim,
+  channel(_name: string) {
+    return new ChannelShim()
+  },
+  removeChannel(channel: any) {
+    if (channel && typeof channel.unsubscribe === 'function') {
+      channel.unsubscribe()
+    }
+    return Promise.resolve('ok')
+  },
+}

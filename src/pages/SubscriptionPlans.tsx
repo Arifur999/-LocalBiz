@@ -1,0 +1,759 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { CopyIcon as Copy, CrownIcon as Crown, GlobeIcon as Globe, ShieldCheckIcon as ShieldCheck, DeviceMobileIcon as Smartphone, SparkleIcon as Sparkles, TimerIcon as Timer } from '@phosphor-icons/react'
+import { Navigate, useNavigate } from 'react-router-dom'
+import toast from 'react-hot-toast'
+import { choosePlan as choosePlanRequest, getPaymentInfo, submitManualPayment } from '../services/admin.services'
+import { Lang, useLang } from '../context/LanguageContext'
+import { useAuth } from '../context/AuthContext'
+import PendingApproval from '../components/PendingApproval'
+import PlanCard from '../components/PlanCard'
+import { planFeatures } from '../lib/planFeatures'
+import { FALLBACK_PLAN_PRICES } from '../lib/planPricing'
+import { whatsAppLink } from '../lib/support'
+import Modal from '../components/Modal'
+
+type PlanId = 'free_trial' | 'monthly' | 'yearly'
+
+// Formats a plain number the same way the rest of the app shows currency.
+function formatBDT(value: number) {
+  return `৳${Number(value || 0).toLocaleString('en-BD')}`
+}
+
+// "20% OFF" / "২০% ছাড়" - computed from the two super-admin-set prices
+// rather than hardcoded, so it never drifts out of sync if either changes.
+function discountLabelText(percent: number, lang: Lang) {
+  return lang === 'bn' ? `${percent}% ছাড়` : `${percent}% OFF`
+}
+
+const planCopy = {
+  en: {
+    title: 'Choose Your Workspace Plan',
+    subtitle: 'Get started with a 7-day risk-free trial. Upgrade or cancel anytime.',
+    freeTitle: '7-Day Free Trial',
+    freeButton: 'Start Free Trial',
+    yearlyTitle: 'Yearly Subscription',
+    yearlyBadge: 'BEST VALUE',
+    yearlyButton: 'Get Yearly Access',
+    processing: 'Processing...',
+    // --- Checkout: step 1 (send money) ---
+    checkoutTitle: 'Pay via bKash',
+    checkoutSubtitle: 'Send the amount below using bKash, then submit your transaction details.',
+    amountLabel: 'Amount to pay',
+    bkashNumberLabel: 'Send Money to this bKash number',
+    copy: 'Copy',
+    copied: 'Copied!',
+    scanQr: 'Or scan this QR code in your bKash app',
+    timeLeft: 'Complete payment within',
+    sessionExpired: 'This checkout session expired. Please choose your plan again.',
+    nextStep: 'I have paid - Next',
+    backToPlans: 'Back to plans',
+    // --- Checkout: step 2 (submit trx) ---
+    submitTitle: 'Submit Payment Details',
+    submitSubtitle: 'Enter the bKash number you paid FROM and the Transaction ID (TrxID) from your bKash confirmation SMS.',
+    senderNumberLabel: 'Your bKash number',
+    senderNumberPlaceholder: '01XXXXXXXXX',
+    trxIdLabel: 'Transaction ID (TrxID)',
+    trxIdPlaceholder: 'e.g. 9J7K2L1M0N',
+    back: 'Back',
+    submit: 'Submit for Approval',
+    submitting: 'Submitting...',
+    // --- Checkout: done ---
+    doneTitle: 'Payment Submitted!',
+    doneSubtitle: 'Your payment is now waiting for super admin approval. You will get full access as soon as it is approved.',
+    goDashboard: 'Go to workspace',
+    noPlanTitle: 'Your plan has expired',
+    noPlanBody: 'There is no active plan on this workspace, so there is nothing to go back to yet. Choose a plan below and your data is waiting exactly as you left it.',
+    noPlanAction: 'See the plans',
+    freeUsedButton: 'Trial Already Used',
+    freeUsedNote: "You've already used your free trial. Please ask your super admin to grant a trial extension.",
+    // --- Free-trial info popup ---
+    trialPopupTitle: 'Start your 7-day free trial',
+    trialPopupSubtitle: 'Confirm your details and your trial will begin right away.',
+    trialName: 'Full Name',
+    trialEmail: 'Email',
+    trialPhone: 'Phone Number',
+    trialAddress: 'Address',
+    trialSubmit: 'Start Free Trial',
+    trialCancel: 'Cancel',
+    trialStarted: 'Your 7-day free trial has started!',
+    trialPopupRequired: 'Please fill in name, phone and address',
+  },
+  bn: {
+    title: 'আপনার ওয়ার্কস্পেস প্ল্যান নির্বাচন করুন',
+    subtitle: '৭ দিনের ঝুঁকিমুক্ত ট্রায়াল দিয়ে শুরু করুন। যেকোনো সময় আপগ্রেড বা বাতিল করুন।',
+    freeTitle: '৭ দিনের ফ্রি ট্রায়াল',
+    freeButton: 'ফ্রি ট্রায়াল শুরু করুন',
+    yearlyTitle: 'বার্ষিক সাবস্ক্রিপশন',
+    yearlyBadge: 'সেরা অফার',
+    yearlyButton: 'বার্ষিক অ্যাক্সেস নিন',
+    processing: 'প্রসেস হচ্ছে...',
+    checkoutTitle: 'বিকাশে পেমেন্ট করুন',
+    checkoutSubtitle: 'নিচের নম্বরে বিকাশ দিয়ে টাকা পাঠান, তারপর ট্রানজেকশনের তথ্য জমা দিন।',
+    amountLabel: 'পরিশোধের পরিমাণ',
+    bkashNumberLabel: 'এই বিকাশ নম্বরে Send Money করুন',
+    copy: 'কপি করুন',
+    copied: 'কপি হয়েছে!',
+    scanQr: 'অথবা বিকাশ অ্যাপে এই QR কোড স্ক্যান করুন',
+    timeLeft: 'এর মধ্যে পেমেন্ট সম্পন্ন করুন',
+    sessionExpired: 'চেকআউট সেশনের মেয়াদ শেষ হয়ে গেছে। আবার প্ল্যান নির্বাচন করুন।',
+    nextStep: 'পেমেন্ট করেছি - পরবর্তী',
+    backToPlans: 'প্ল্যানে ফিরে যান',
+    submitTitle: 'পেমেন্টের তথ্য জমা দিন',
+    submitSubtitle: 'যে বিকাশ নম্বর থেকে টাকা পাঠিয়েছেন এবং বিকাশের কনফার্মেশন এসএমএসের ট্রানজেকশন আইডি (TrxID) লিখুন।',
+    senderNumberLabel: 'আপনার বিকাশ নম্বর',
+    senderNumberPlaceholder: '০১XXXXXXXXX',
+    trxIdLabel: 'ট্রানজেকশন আইডি (TrxID)',
+    trxIdPlaceholder: 'যেমন: 9J7K2L1M0N',
+    back: 'পেছনে',
+    submit: 'অনুমোদনের জন্য জমা দিন',
+    submitting: 'জমা হচ্ছে...',
+    doneTitle: 'পেমেন্ট জমা হয়েছে!',
+    doneSubtitle: 'আপনার পেমেন্ট এখন সুপার অ্যাডমিনের অনুমোদনের অপেক্ষায় আছে। অনুমোদন হলেই সম্পূর্ণ অ্যাক্সেস পাবেন।',
+    goDashboard: 'ওয়ার্কস্পেসে যান',
+    noPlanTitle: 'আপনার প্ল্যানের মেয়াদ শেষ',
+    noPlanBody: 'এই ওয়ার্কস্পেসে এখন কোনো সচল প্ল্যান নেই, তাই ফিরে যাওয়ার মতো কিছু নেই। নিচ থেকে একটি প্ল্যান নিন — আপনার সব ডেটা যেমন ছিল তেমনই আছে।',
+    noPlanAction: 'প্ল্যানগুলো দেখুন',
+    freeUsedButton: 'ট্রায়াল ব্যবহৃত হয়ে গেছে',
+    freeUsedNote: 'আপনি ইতিমধ্যে আপনার ফ্রি ট্রায়াল ব্যবহার করে ফেলেছেন। ট্রায়াল বাড়ানোর জন্য আপনার সুপার অ্যাডমিনের সাথে যোগাযোগ করুন।',
+    trialPopupTitle: '৭ দিনের ফ্রি ট্রায়াল শুরু করুন',
+    trialPopupSubtitle: 'আপনার তথ্য নিশ্চিত করুন, সাথে সাথেই ট্রায়াল শুরু হয়ে যাবে।',
+    trialName: 'পূর্ণ নাম',
+    trialEmail: 'ইমেইল',
+    trialPhone: 'ফোন নম্বর',
+    trialAddress: 'ঠিকানা',
+    trialSubmit: 'ফ্রি ট্রায়াল শুরু করুন',
+    trialCancel: 'বাতিল',
+    trialStarted: 'আপনার ৭ দিনের ফ্রি ট্রায়াল শুরু হয়েছে!',
+    trialPopupRequired: 'নাম, ফোন ও ঠিকানা পূরণ করুন',
+  },
+} satisfies Record<Lang, Record<string, string>>
+
+// localStorage key that carries the selected plan + the moment it was chosen
+// across the /choose-plan -> /subscription-checkout navigation. The
+// checkout page uses `selectedAt` to run its 30-minute payment countdown.
+const CHECKOUT_STORAGE_KEY = 'subscription_checkout_plan'
+
+export default function SubscriptionPlans() {
+  const { user, profile, subscription, subscriptionStatus, refreshAccount } = useAuth()
+  const { lang, setLang, t } = useLang()
+  const navigate = useNavigate()
+  const [loadingPlan, setLoadingPlan] = useState<PlanId | null>(null)
+  // Free-trial lead-capture popup: opened from the trial card, collects the
+  // owner's contact info (for the super admin's follow-up) before starting
+  // the 7-day trial.
+  const [showTrialPopup, setShowTrialPopup] = useState(false)
+  const [trialForm, setTrialForm] = useState({ full_name: '', phone: '', address: '' })
+  const [startingTrial, setStartingTrial] = useState(false)
+  // Both prices are set by the super admin (Settings -> Payment info) and
+  // fetched here so the card never shows a stale hard-coded number.
+  const [yearlyPrice, setYearlyPrice] = useState<number | null>(null)
+  const [yearlyOriginalPrice, setYearlyOriginalPrice] = useState<number | null>(null)
+  const [monthlyPrice, setMonthlyPrice] = useState<number | null>(null)
+  const [supportNumber, setSupportNumber] = useState('')
+  // Shown when the logo is clicked with no plan to go back to.
+  const [showNoPlanPrompt, setShowNoPlanPrompt] = useState(false)
+  const copy = (key: keyof typeof planCopy.en) => t(`plans_${key}`, planCopy[lang][key])
+  // Every owner's free trial is spent automatically at registration, so this
+  // is true for essentially everyone who lands here - it only ever turns
+  // false again if a super admin grants a fresh trial extension.
+  const trialUsed = Boolean(subscription?.trial_used)
+
+  useEffect(() => {
+    getPaymentInfo()
+      .then(info => {
+        setYearlyPrice(Number(info.yearly_price))
+        setYearlyOriginalPrice(Number(info.yearly_original_price))
+        setMonthlyPrice(Number(info.monthly_price))
+        setSupportNumber(String((info as any).support_number || ''))
+      })
+      .catch(() => {
+        // sane fallback if settings can't load
+        setYearlyPrice(FALLBACK_PLAN_PRICES.yearly)
+        setYearlyOriginalPrice(FALLBACK_PLAN_PRICES.yearlyOriginal)
+        setMonthlyPrice(FALLBACK_PLAN_PRICES.monthly)
+      })
+  }, [])
+
+  // Only show the strikethrough treatment when it actually reads as a
+  // discount - guards against a misconfigured original price in settings.
+  const discountPercent = yearlyPrice && yearlyOriginalPrice && yearlyOriginalPrice > yearlyPrice
+    ? Math.round((1 - yearlyPrice / yearlyOriginalPrice) * 100)
+    : null
+
+  const plans = useMemo(() => [
+    {
+      id: 'free_trial' as const,
+      title: copy('freeTitle'),
+      price: lang === 'bn' ? 'ফ্রি' : 'Free',
+      period: lang === 'bn' ? '/ ৭ দিন' : '/ 7 days',
+      originalPrice: undefined as string | undefined,
+      discountLabel: undefined as string | undefined,
+      features: planFeatures(lang, 'free_trial'),
+      button: trialUsed ? copy('freeUsedButton') : copy('freeButton'),
+      note: trialUsed ? copy('freeUsedNote') : undefined,
+      disabled: trialUsed,
+      icon: <Sparkles size={22} weight="duotone" />,
+      popular: false,
+    },
+    {
+      id: 'monthly' as const,
+      title: lang === 'bn' ? 'মাসিক প্ল্যান' : 'Monthly Plan',
+      price: monthlyPrice === null ? '...' : formatBDT(monthlyPrice),
+      period: lang === 'bn' ? '/ মাস' : '/ month',
+      originalPrice: undefined as string | undefined,
+      discountLabel: undefined as string | undefined,
+      features: planFeatures(lang, 'monthly'),
+      button: lang === 'bn' ? 'মাসিক প্ল্যান নিন' : 'Choose Monthly',
+      note: undefined as string | undefined,
+      disabled: false,
+      icon: <Timer size={22} weight="duotone" />,
+      popular: false,
+    },
+    {
+      id: 'yearly' as const,
+      title: copy('yearlyTitle'),
+      price: yearlyPrice === null ? '...' : formatBDT(yearlyPrice),
+      period: lang === 'bn' ? '/ বছর' : '/ year',
+      originalPrice: discountPercent !== null && yearlyOriginalPrice ? formatBDT(yearlyOriginalPrice) : undefined,
+      discountLabel: discountPercent !== null ? discountLabelText(discountPercent, lang) : undefined,
+      features: planFeatures(lang, 'yearly'),
+      button: copy('yearlyButton'),
+      note: undefined as string | undefined,
+      disabled: false,
+      icon: <Crown size={22} weight="duotone" />,
+      popular: true,
+    },
+  ], [lang, t, yearlyPrice, yearlyOriginalPrice, monthlyPrice, discountPercent, trialUsed])
+
+  // The logo is the way back into the app. Whether there is an app to go back
+  // to is the same question App.tsx asks before it lets anyone past the router,
+  // so it is answered from the same value rather than by re-reading the
+  // subscription here and possibly disagreeing with it.
+  const hasWorkspaceAccess = subscriptionStatus === 'active' || subscriptionStatus === 'trial'
+
+  function handleLogoClick() {
+    if (hasWorkspaceAccess) navigate('/', { replace: true })
+    else setShowNoPlanPrompt(true)
+  }
+
+  if (!user) return <Navigate to="/register" replace />
+
+  // A payment already awaiting approval outranks the plan cards: showing the
+  // cards again would invite a duplicate payment. Server-driven, so it survives
+  // a reload.
+  const pendingPayment = (subscription as any)?.pending_payment
+  if (pendingPayment) {
+    return (
+      <PendingApproval
+        lang={lang}
+        planType={pendingPayment.plan_type}
+        submittedAt={pendingPayment.submitted_at}
+        supportNumber={supportNumber}
+        onGoDashboard={() => navigate('/', { replace: true })}
+        goDashboardLabel={copy('goDashboard')}
+      />
+    )
+  }
+
+  // Trial card -> open the info popup (prefilled from the account). Yearly card
+  // -> go straight to the manual bKash checkout as before.
+  function handlePlanClick(planId: PlanId) {
+    if (!user) return
+    if (planId === 'free_trial') {
+      if (trialUsed) {
+        toast.error(copy('freeUsedNote'))
+        return
+      }
+      setTrialForm({
+        full_name: profile?.full_name || '',
+        phone: profile?.phone || '',
+        address: subscription?.address || '',
+      })
+      setShowTrialPopup(true)
+      return
+    }
+    choosePlan(planId)
+  }
+
+  // Yearly checkout path (unchanged): flip the subscription to pending and
+  // hand off to the manual bKash checkout screen.
+  async function choosePlan(planId: PlanId) {
+    if (!user) return
+    setLoadingPlan(planId)
+    try {
+      await choosePlanRequest({ plan_type: planId })
+    } catch (error: any) {
+      toast.error(error.message)
+      setLoadingPlan(null)
+      return
+    }
+    await refreshAccount()
+    setLoadingPlan(null)
+    // selectedAt anchors the checkout page's 30-minute payment countdown.
+    localStorage.setItem(CHECKOUT_STORAGE_KEY, JSON.stringify({ planId, selectedAt: new Date().toISOString() }))
+    navigate('/subscription-checkout', { replace: true, state: { planId } })
+  }
+
+  // Popup submit: save the contact info + start the 7-day trial, then enter
+  // the workspace.
+  async function startTrial(e: React.FormEvent) {
+    e.preventDefault()
+    if (!trialForm.full_name.trim() || !trialForm.phone.trim() || !trialForm.address.trim()) {
+      toast.error(copy('trialPopupRequired'))
+      return
+    }
+    setStartingTrial(true)
+    try {
+      await choosePlanRequest({
+        plan_type: 'free_trial',
+        full_name: trialForm.full_name.trim(),
+        phone: trialForm.phone.trim(),
+        address: trialForm.address.trim(),
+      })
+    } catch (error: any) {
+      toast.error(error.message)
+      setStartingTrial(false)
+      return
+    }
+    await refreshAccount()
+    setStartingTrial(false)
+    setShowTrialPopup(false)
+    toast.success(copy('trialStarted'))
+    navigate('/', { replace: true })
+  }
+
+  return (
+    // h-screen + overflow-y-auto, not min-h-screen: index.css puts
+    // overflow:hidden on html, body and #root so the app shell can own its own
+    // scrolling, and this page lives outside that shell. Left as min-h-screen
+    // everything below the fold is in the DOM and unreachable.
+    <div className="flex h-screen flex-col overflow-y-auto bg-white px-4 py-8">
+      {/* The way back into the app. A plan page with no logo is a dead end -
+          there is nothing on it that leads anywhere except a payment. */}
+      <button
+        type="button"
+        onClick={handleLogoClick}
+        title={hasWorkspaceAccess ? copy('goDashboard') : undefined}
+        className="fixed left-6 top-6 z-20 rounded-lg p-1 transition hover:opacity-80 lg:left-36 lg:top-16"
+      >
+        <img src="/logo-dark.png" alt={t('appName')} className="h-8 w-auto object-contain" />
+      </button>
+
+      {/* Mirrors the logo opposite it, rather than sitting in the corner on
+          its own while the logo is set in. */}
+      <div className="fixed right-6 top-6 lg:right-36 lg:top-16 z-20 flex items-center gap-1 rounded-lg bg-white p-0.5 shadow-sm">
+        <Globe size={13} className="ml-1.5 text-slate-400" />
+        <button onClick={() => setLang('en')} className={`rounded-md px-2.5 py-1 text-xs font-semibold ${lang === 'en' ? 'bg-slate-900 text-white' : 'text-slate-500'}`}>EN</button>
+        <button onClick={() => setLang('bn')} className={`rounded-md px-2.5 py-1 text-xs font-semibold ${lang === 'bn' ? 'bg-slate-900 text-white' : 'text-slate-500'}`}>বাংলা</button>
+      </div>
+
+      <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col justify-center">
+        <header className="mx-auto mb-8 max-w-2xl text-center">
+          <h1 className="text-3xl font-black text-slate-950 sm:text-4xl">{copy('title')}</h1>
+          <p className="mt-3 text-sm leading-relaxed text-slate-500 sm:text-base">{copy('subtitle')}</p>
+        </header>
+
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+          {plans.map(plan => (
+            <PlanCard
+              key={plan.id}
+              icon={plan.icon}
+              title={plan.title}
+              tagline={plan.features.tagline}
+              price={plan.price}
+              period={plan.period}
+              originalPrice={plan.originalPrice}
+              discountLabel={plan.discountLabel}
+              included={plan.features.included}
+              missing={plan.features.missing}
+              buttonLabel={loadingPlan === plan.id ? copy('processing') : plan.button}
+              note={plan.note}
+              onSelect={() => handlePlanClick(plan.id)}
+              disabled={loadingPlan !== null || plan.disabled}
+              popular={plan.popular}
+              popularLabel={copy('yearlyBadge')}
+            />
+          ))}
+        </div>
+      </div>
+
+      {showTrialPopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !startingTrial && setShowTrialPopup(false)}>
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-black text-slate-950">{copy('trialPopupTitle')}</h3>
+            <p className="mt-1 text-sm text-slate-500">{copy('trialPopupSubtitle')}</p>
+            <form onSubmit={startTrial} className="mt-4 space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-700">{copy('trialName')}</label>
+                <input
+                  type="text"
+                  value={trialForm.full_name}
+                  onChange={e => setTrialForm({ ...trialForm, full_name: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-900/15"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-700">{copy('trialEmail')}</label>
+                <input
+                  type="email"
+                  value={user?.email || ''}
+                  readOnly
+                  className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-700">{copy('trialPhone')}</label>
+                <input
+                  type="text"
+                  value={trialForm.phone}
+                  onChange={e => setTrialForm({ ...trialForm, phone: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-900/15"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-700">{copy('trialAddress')}</label>
+                <textarea
+                  rows={2}
+                  value={trialForm.address}
+                  onChange={e => setTrialForm({ ...trialForm, address: e.target.value })}
+                  className="w-full resize-y rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-900/15"
+                />
+              </div>
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={startingTrial}
+                  className="flex-1 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-black text-white hover:bg-black disabled:opacity-60"
+                >
+                  {startingTrial ? copy('processing') : copy('trialSubmit')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowTrialPopup(false)}
+                  disabled={startingTrial}
+                  className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 hover:bg-neutral-100 disabled:opacity-60"
+                >
+                  {copy('trialCancel')}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Clicking the logo with an expired plan: say why there is nowhere to go
+          and point at the thing that fixes it, rather than silently doing
+          nothing. */}
+      <Modal isOpen={showNoPlanPrompt} onClose={() => setShowNoPlanPrompt(false)} title={copy('noPlanTitle')} size="sm">
+        <div className="space-y-4">
+          <p className="text-sm leading-relaxed text-slate-600">{copy('noPlanBody')}</p>
+          <button
+            type="button"
+            onClick={() => setShowNoPlanPrompt(false)}
+            className="w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-black text-white hover:bg-black"
+          >
+            {copy('noPlanAction')}
+          </button>
+        </div>
+      </Modal>
+
+      {/* Support, in the same corner it sits in inside the app. This page is
+          where somebody is most likely to need it. */}
+      <a
+        href={whatsAppLink(supportNumber)}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Chat with support on WhatsApp"
+        aria-label="Chat with support on WhatsApp"
+        className="fixed bottom-5 right-5 z-40 flex items-center justify-center rounded-full bg-[#25D366] p-3 text-white shadow-lg shadow-green-600/30 transition hover:bg-[#20bd5a]"
+      >
+        <svg viewBox="0 0 32 32" width="24" height="24" fill="currentColor" aria-hidden="true">
+          <path d="M16.01 3C9.38 3 4 8.37 4 15c0 2.1.55 4.15 1.6 5.96L4 29l8.24-1.56A12.9 12.9 0 0 0 16 27c6.63 0 12-5.37 12-12S22.64 3 16.01 3zm0 21.8c-1.9 0-3.77-.5-5.4-1.46l-.39-.23-4.9.93.93-4.78-.25-.4A9.77 9.77 0 0 1 6.2 15c0-5.4 4.4-9.8 9.8-9.8 5.42 0 9.82 4.4 9.82 9.8s-4.4 9.8-9.81 9.8zm5.6-7.34c-.3-.15-1.8-.9-2.08-1-.28-.1-.48-.15-.68.15-.2.3-.78 1-.96 1.2-.18.2-.35.22-.65.08-.3-.15-1.28-.47-2.44-1.5-.9-.8-1.5-1.8-1.68-2.1-.18-.3-.02-.46.13-.6.13-.13.3-.34.45-.5.15-.17.2-.3.3-.5.1-.2.05-.37-.02-.52-.08-.15-.68-1.63-.93-2.23-.24-.58-.5-.5-.68-.5l-.58-.01c-.2 0-.52.07-.8.37-.28.3-1.05 1.02-1.05 2.5s1.08 2.9 1.23 3.1c.15.2 2.12 3.24 5.14 4.55.72.3 1.28.48 1.71.62.72.23 1.37.2 1.9.12.58-.09 1.8-.74 2.05-1.45.25-.72.25-1.33.18-1.46-.07-.13-.27-.2-.57-.35z" />
+        </svg>
+      </a>
+    </div>
+  )
+}
+
+// 30 minutes to complete the manual bKash payment before the checkout
+// session is considered abandoned and the owner is sent back to /choose-plan.
+const CHECKOUT_WINDOW_MS = 30 * 60 * 1000
+
+function formatCountdown(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+interface PaymentInfo {
+  bkash_number: string
+  bkash_qr_url: string
+  yearly_price: number
+  monthly_price: number
+  support_number?: string
+}
+
+export function SubscriptionCheckout() {
+  const { user, subscription, refreshAccount } = useAuth()
+  const { lang, setLang, t } = useLang()
+  const navigate = useNavigate()
+  const copy = (key: keyof typeof planCopy.en) => t(`plans_${key}`, planCopy[lang][key])
+
+  // 1 = "send the money", 2 = "submit trx details", 'done' = submitted.
+  const [step, setStep] = useState<1 | 2 | 'done'>(1)
+  const [paymentInfo, setPaymentInfo] = useState<PaymentInfo | null>(null)
+  const [deadline, setDeadline] = useState<number | null>(null)
+  const [remainingMs, setRemainingMs] = useState(CHECKOUT_WINDOW_MS)
+  const [copied, setCopied] = useState(false)
+  const [senderNumber, setSenderNumber] = useState('')
+  const [trxId, setTrxId] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  // Local fallback anchor for the wait screen, used for the instant transition
+  // right after submitting (before/if the refreshed subscription arrives).
+  const [submittedAt, setSubmittedAt] = useState<string | null>(null)
+  const [planId, setPlanId] = useState<'monthly' | 'yearly'>('yearly')
+  const expiredRef = useRef(false)
+
+  const checkoutAmount = paymentInfo ? (planId === 'monthly' ? paymentInfo.monthly_price : paymentInfo.yearly_price) : null
+
+  // A payment already awaiting approval wins over the checkout form, so a
+  // reload after submitting keeps showing the wait screen (the state lives on
+  // the server) instead of bouncing back to the plan cards.
+  const pendingPayment = (subscription as any)?.pending_payment
+
+  // Load the checkout session (selectedAt) written by the Plans page, and
+  // fetch where the money should actually go.
+  useEffect(() => {
+    if (pendingPayment) return
+    const raw = localStorage.getItem(CHECKOUT_STORAGE_KEY)
+    if (!raw) {
+      navigate('/choose-plan', { replace: true })
+      return
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { planId?: string; selectedAt?: string }
+      const selectedAt = parsed.selectedAt ? new Date(parsed.selectedAt).getTime() : NaN
+      if ((parsed.planId !== 'yearly' && parsed.planId !== 'monthly') || Number.isNaN(selectedAt)) {
+        navigate('/choose-plan', { replace: true })
+        return
+      }
+      setPlanId(parsed.planId)
+      setDeadline(selectedAt + CHECKOUT_WINDOW_MS)
+    } catch {
+      navigate('/choose-plan', { replace: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    getPaymentInfo()
+      .then(info => setPaymentInfo({ ...info, yearly_price: Number(info.yearly_price), monthly_price: Number(info.monthly_price) }))
+      .catch(() => toast.error('Could not load payment info'))
+  }, [])
+
+  // Tick the countdown once a second; redirect back once time runs out.
+  useEffect(() => {
+    if (deadline === null || step === 'done' || pendingPayment) return
+
+    const tick = () => {
+      const remaining = deadline - Date.now()
+      setRemainingMs(remaining)
+
+      if (remaining <= 0 && !expiredRef.current) {
+        expiredRef.current = true
+        localStorage.removeItem(CHECKOUT_STORAGE_KEY)
+        toast.error(copy('sessionExpired'))
+        navigate('/choose-plan', { replace: true })
+      }
+    }
+
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deadline, step])
+
+  if (!user) return <Navigate to="/login" replace />
+
+  // Awaiting approval: prefer the server's record (survives reloads), fall back
+  // to the just-submitted timestamp for the immediate post-submit transition.
+  if (pendingPayment || (step === 'done' && submittedAt)) {
+    return (
+      <PendingApproval
+        lang={lang}
+        planType={pendingPayment?.plan_type || planId}
+        submittedAt={pendingPayment?.submitted_at || submittedAt}
+        supportNumber={paymentInfo?.support_number}
+        onGoDashboard={() => navigate('/', { replace: true })}
+        goDashboardLabel={copy('goDashboard')}
+      />
+    )
+  }
+
+  async function copyBkashNumber() {
+    if (!paymentInfo?.bkash_number) return
+    try {
+      await navigator.clipboard.writeText(paymentInfo.bkash_number)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      toast.error('Could not copy - please copy manually')
+    }
+  }
+
+  async function handleSubmitPayment(e: React.FormEvent) {
+    e.preventDefault()
+
+    if (!/^01[0-9]{9}$/.test(senderNumber.trim())) {
+      toast.error(lang === 'bn' ? 'সঠিক ১১-সংখ্যার বিকাশ নম্বর দিন' : 'Enter a valid 11-digit bKash number')
+      return
+    }
+    if (trxId.trim().length < 6) {
+      toast.error(lang === 'bn' ? 'সঠিক ট্রানজেকশন আইডি দিন' : 'Enter a valid transaction ID')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      await submitManualPayment({ sender_number: senderNumber.trim(), trx_id: trxId.trim().toUpperCase(), plan_type: planId })
+      localStorage.removeItem(CHECKOUT_STORAGE_KEY)
+      // The payment now exists server-side as "pending" - refreshing the auth
+      // context surfaces it as subscription.pending_payment, which is what
+      // renders the wait screen (and keeps rendering it after a reload).
+      setSubmittedAt(new Date().toISOString())
+      setStep('done')
+      await refreshAccount()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to submit payment')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-white p-4">
+      <div className="fixed right-4 top-4 z-20 flex items-center gap-1 rounded-lg bg-white p-0.5 shadow-sm">
+        <Globe size={13} className="ml-1.5 text-slate-400" />
+        <button onClick={() => setLang('en')} className={`rounded-md px-2.5 py-1 text-xs font-semibold ${lang === 'en' ? 'bg-slate-900 text-white' : 'text-slate-500'}`}>EN</button>
+        <button onClick={() => setLang('bn')} className={`rounded-md px-2.5 py-1 text-xs font-semibold ${lang === 'bn' ? 'bg-slate-900 text-white' : 'text-slate-500'}`}>বাংলা</button>
+      </div>
+
+      <div className={`w-full rounded-2xl border border-slate-200 bg-white p-8 shadow-xl ${step === 1 && paymentInfo?.bkash_qr_url ? 'max-w-4xl' : 'max-w-lg'}`}>
+        {step === 1 ? (
+          <div>
+            <div className="text-center">
+              <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-pink-50 text-pink-600">
+                <Smartphone size={28} />
+              </div>
+              <h1 className="text-2xl font-black text-slate-950">{copy('checkoutTitle')}</h1>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">{copy('checkoutSubtitle')}</p>
+            </div>
+
+            <div className={`mt-6 grid gap-5 ${paymentInfo?.bkash_qr_url ? 'md:grid-cols-2 md:items-stretch' : ''}`}>
+              {/* Left column: amount, bKash number, timer */}
+              <div className="space-y-4">
+                <div className="rounded-xl border border-slate-200 bg-white p-4 text-center">
+                  <p className="text-xs font-bold uppercase tracking-wide text-slate-400">{copy('amountLabel')} · {planId === 'monthly' ? (lang === 'bn' ? 'মাসিক' : 'Monthly') : (lang === 'bn' ? 'বার্ষিক' : 'Yearly')}</p>
+                  <p className="mt-1 text-3xl font-black text-slate-950">
+                    {checkoutAmount !== null ? formatBDT(checkoutAmount) : '...'}
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-pink-200 bg-pink-50 p-4">
+                  <p className="text-xs font-bold uppercase tracking-wide text-pink-700">{copy('bkashNumberLabel')}</p>
+                  <div className="mt-1 flex items-center justify-between gap-3">
+                    <span className="text-xl font-black tracking-wider text-slate-950">
+                      {paymentInfo?.bkash_number || '...'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={copyBkashNumber}
+                      disabled={!paymentInfo?.bkash_number}
+                      className="flex items-center gap-1.5 rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-pink-700 shadow-sm hover:bg-pink-100 disabled:opacity-50"
+                    >
+                      <Copy size={13} />
+                      {copied ? copy('copied') : copy('copy')}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-center gap-2 rounded-xl bg-slate-100 px-4 py-2.5 text-sm font-bold text-slate-700">
+                  <Timer size={16} className={remainingMs < 5 * 60 * 1000 ? 'text-red-600' : 'text-slate-500'} />
+                  <span>{copy('timeLeft')}:</span>
+                  <span className={remainingMs < 5 * 60 * 1000 ? 'text-red-600' : 'text-slate-900'}>{formatCountdown(remainingMs)}</span>
+                </div>
+              </div>
+
+              {/* Right column: large scannable QR that fills the box */}
+              {paymentInfo?.bkash_qr_url && (
+                <div className="flex flex-col rounded-xl border border-slate-200 bg-white p-4">
+                  <p className="mb-3 text-center text-sm font-semibold text-slate-600">{copy('scanQr')}</p>
+                  <div className="flex flex-1 items-center justify-center">
+                    <img src={paymentInfo.bkash_qr_url} alt="bKash QR code" className="aspect-square w-full max-w-[380px] rounded-xl border border-slate-200 bg-white object-contain p-3" />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <button onClick={() => navigate('/choose-plan')} className="rounded-xl border border-slate-200 px-4 py-3 text-sm font-bold text-slate-700 hover:bg-neutral-100">
+                {copy('backToPlans')}
+              </button>
+              <button onClick={() => setStep(2)} className="rounded-xl bg-slate-900 px-4 py-3 text-sm font-bold text-white hover:bg-black">
+                {copy('nextStep')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmitPayment}>
+            <div className="text-center">
+              <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-900 text-white">
+                <ShieldCheck size={28} />
+              </div>
+              <h1 className="text-2xl font-black text-slate-950">{copy('submitTitle')}</h1>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">{copy('submitSubtitle')}</p>
+            </div>
+
+            <div className="mt-6 space-y-4">
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-950">{copy('senderNumberLabel')}</label>
+                <input
+                  type="tel"
+                  inputMode="numeric"
+                  maxLength={11}
+                  value={senderNumber}
+                  onChange={e => setSenderNumber(e.target.value.replace(/\D/g, ''))}
+                  placeholder={copy('senderNumberPlaceholder')}
+                  className="input"
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-950">{copy('trxIdLabel')}</label>
+                <input
+                  type="text"
+                  value={trxId}
+                  onChange={e => setTrxId(e.target.value.toUpperCase())}
+                  placeholder={copy('trxIdPlaceholder')}
+                  className="input uppercase"
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <button type="button" onClick={() => setStep(1)} className="rounded-xl border border-slate-200 px-4 py-3 text-sm font-bold text-slate-700 hover:bg-neutral-100">
+                {copy('back')}
+              </button>
+              <button type="submit" disabled={submitting} className="rounded-xl bg-slate-900 px-4 py-3 text-sm font-bold text-white hover:bg-black disabled:opacity-60">
+                {submitting ? copy('submitting') : copy('submit')}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  )
+}

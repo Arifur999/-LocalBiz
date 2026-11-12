@@ -1,0 +1,825 @@
+import React, { useEffect, useMemo, useState } from 'react'
+import { PlusIcon as Plus, PrinterIcon as Printer, FloppyDiskIcon as Save, PencilSimpleIcon as Pencil, TrashIcon as Trash2, XIcon as X } from '@phosphor-icons/react'
+import toast from 'react-hot-toast'
+import PageHeader from '../../components/PageHeader'
+import Modal from '../../components/Modal'
+import SearchableSelect from '../../components/SearchableSelect'
+import PeriodFilter from '../../components/PeriodFilter'
+import { supabase } from '../../lib/supabase'
+import { formatDate, roundTaka, todayISO } from '../../lib/utils'
+import { useAuth } from '../../context/AuthContext'
+import { useLang } from '../../context/LanguageContext'
+import { confirmAction } from '../../components/ConfirmDialog'
+import { buildLoanSummary, categoryDetail, expenseCategoryFields, incomeSourceFields, lenderKey, loanBalanceColor, loanBalanceLabel, loanDisplayName, needsExpenseCategory, needsIncomeSource, transactionAmounts, transactionLabel } from './loanUtils'
+import { isLoanLenderTableMissing, mergeStoredAndLegacyLoanLenders, mergeStoredAndLoanLenders } from './loanFallback'
+import { addRecycleItem } from '../../lib/recycleBin'
+import TableSkeleton from '../../components/TableSkeleton'
+import { useProgressiveRows } from '../../lib/useProgressiveRows'
+import { NoValue, ZeroAmount } from '../../components/CellValue'
+import { buildLoanTransactionSms } from '../../lib/smsTemplates'
+import { sendSms } from '../../services/sms.services'
+import { smsFailureMessage } from '../../lib/smsPermission'
+import { isValidBdPhone } from '../../lib/phone'
+import { openPrintDialog } from '../../lib/printTable'
+import { inPeriod, periodLabel, type Period } from '../../lib/periodFilter'
+
+type LoanTransactionValidationErrors = Partial<Record<'date' | 'lender_id' | 'transaction_type' | 'amount' | 'account_id' | 'expense_category_id', string>>
+
+const REQUIRED_FIELD_MESSAGE = 'This field is required!'
+
+// Remembered per browser: an owner who texts every receipt should not have to
+// flip the switch on every transaction. Same key shape as the due-received one.
+const SMS_RECEIPT_KEY = 'loan_transaction_sms_v1'
+
+function escapeHtml(value: string) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+}
+
+function formatPrintAmount(value: number) {
+  return roundTaka(value).toLocaleString('en-US')
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
+export default function LoanTransactions() {
+  const { formatCurr } = useLang()
+  const { user, profile } = useAuth()
+  const [records, setRecords] = useState<any[]>([])
+  // Starts true so the table shows skeleton rows on the first paint. It
+  // used to render the empty state instead, which reads as "there is
+  // nothing here" rather than "this is still loading".
+  const [loading, setLoading] = useState(true)
+  const [lenders, setLenders] = useState<any[]>([])
+  const [accounts, setAccounts] = useState<any[]>([])
+  // Only ever read for a profit PAYMENT, which is filed as an expense and so
+  // has to say which category.
+  const [categories, setCategories] = useState<any[]>([])
+  // Source names already used in Other Income, offered on a profit receipt so
+  // repeat entries land under one name instead of four spellings of it.
+  const [incomeSources, setIncomeSources] = useState<string[]>([])
+  const [showModal, setShowModal] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [usingFallback, setUsingFallback] = useState(false)
+  // 'all' by default: opening this page should show the whole ledger, not an
+  // empty range waiting for two dates to be typed.
+  const [period, setPeriod] = useState<Period>('all')
+  const [fromDate, setFromDate] = useState('')
+  const [toDate, setToDate] = useState('')
+  const [filterLenderName, setFilterLenderName] = useState('')
+  const [errors, setErrors] = useState<LoanTransactionValidationErrors>({})
+  const [form, setForm] = useState({ date: todayISO(), lender_id: '', transaction_type: '', payment_category: 'principal', expense_category_id: '', income_source_name: '', amount: 0, account_id: '', notes: '' })
+  const [business, setBusiness] = useState<any>(null)
+  const [smsReceipt, setSmsReceipt] = useState(() => localStorage.getItem(SMS_RECEIPT_KEY) === '1')
+
+  useEffect(() => {
+    loadAll().finally(() => setLoading(false))
+    const channel = supabase
+      .channel('loan-transactions-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'loans' }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'loan_lenders' }, loadAll)
+      .subscribe()
+
+    return () => { supabase.removeChannel(channel) }
+  }, [])
+
+  function loanTypeFromLender(lender: any) {
+    return String(lender?.lender_type || '').toLowerCase().includes('bank') ? 'bank' : 'personal'
+  }
+
+  async function loadAll() {
+    const [loanRes, lenderRes, accountRes, businessRes, categoryRes, incomeRes] = await Promise.all([
+      supabase.from('loans').select('*, loan_lenders(*)').order('date', { ascending: false }).order('created_at', { ascending: false }),
+      supabase.from('loan_lenders').select('*').eq('is_active', true).order('name'),
+      supabase.from('accounts').select('*').eq('is_active', true).order('sort_order'),
+      supabase.from('business_settings').select('name_bn, name_en, phone').maybeSingle(),
+      supabase.from('expense_categories').select('*').order('name'),
+      supabase.from('other_incomes').select('source_name'),
+    ])
+    setBusiness(businessRes.data || null)
+    // Set before the fallback branch returns: a legacy database still has
+    // expense categories even when it has no loan_lenders table.
+    setCategories(categoryRes.data || [])
+    // Distinct and sorted, because this is a suggestion list rather than a
+    // table - the same name appears on every month's row.
+    const sourceNames: string[] = (incomeRes.data || [])
+      .map((row: any) => String(row.source_name || '').trim())
+      .filter(Boolean)
+    setIncomeSources([...new Set(sourceNames)].sort((a, b) => a.localeCompare(b)))
+    if (isLoanLenderTableMissing(loanRes.error) || isLoanLenderTableMissing(lenderRes.error)) {
+      const legacyLoanRes = await supabase.from('loans').select('*').order('date', { ascending: false }).order('created_at', { ascending: false })
+      const legacyLoans = legacyLoanRes.data || []
+      setUsingFallback(true)
+      setRecords(legacyLoans)
+      setLenders(mergeStoredAndLegacyLoanLenders(legacyLoans, true))
+      setAccounts(accountRes.data || [])
+      return
+    }
+    setUsingFallback(false)
+    setRecords(loanRes.data || [])
+    setLenders(mergeStoredAndLoanLenders(lenderRes.data || [], true))
+    setAccounts(accountRes.data || [])
+  }
+
+  function resetForm() {
+    setEditingId(null)
+    setShowModal(false)
+    setErrors({})
+    setForm({ date: todayISO(), lender_id: '', transaction_type: '', payment_category: 'principal', expense_category_id: '', income_source_name: '', amount: 0, account_id: '', notes: '' })
+  }
+
+  function editRecord(record: any) {
+    const amounts = transactionAmounts(record)
+    const fallbackLender = lenders.find(lender => lender.name === record.lender_name)
+    setEditingId(record.id)
+    setForm({
+      date: record.date,
+      lender_id: record.lender_id || fallbackLender?.id || '',
+      transaction_type: amounts.type === 'payment' ? 'payment' : 'receive',
+      // Carried through, not defaulted: reopening a profit row and saving it
+      // would otherwise turn it into principal and move a balance that should
+      // not have moved.
+      payment_category: record.payment_category === 'profit' ? 'profit' : 'principal',
+      // Carried through for the same reason as the category above: reopening a
+      // profit payment and saving it must not silently move its expense into a
+      // different category, or out of one entirely.
+      expense_category_id: record.expense_category_id || '',
+      income_source_name: record.income_source_name || '',
+      amount: amounts.received || amounts.paid,
+      account_id: record.account_id || '',
+      notes: record.notes || '',
+    })
+    setErrors({})
+    setShowModal(true)
+  }
+
+  const requiredLabel = (label: string) => (
+    <>
+      {label} <span className="text-brand-red">*</span>
+    </>
+  )
+
+  const inputClass = (field: keyof LoanTransactionValidationErrors) =>
+    `input ${errors[field] ? 'border-red-500 focus:ring-red-500' : ''}`
+
+  const clearError = (field: keyof LoanTransactionValidationErrors) => {
+    if (!errors[field]) return
+    setErrors(current => {
+      const next = { ...current }
+      delete next[field]
+      return next
+    })
+  }
+
+  /**
+   * Where this lender's account stands BEFORE the transaction being entered.
+   *
+   * The record under edit is deliberately left out: its effect is already in
+   * `records`, so counting it would make the projected balance wrong by twice
+   * the amount being changed.
+   *
+   * Signed the way the loan pages sign it - positive is pawna (they owe us),
+   * negative is dena (we owe them).
+   */
+  const balanceBeforeFor = useMemo(() => {
+    const others = editingId ? records.filter(record => record.id !== editingId) : records
+    const summary = buildLoanSummary(lenders, others) as any[]
+    const byKey = new Map(summary.map(row => [row.key, Number(row.balance || 0)]))
+    return (lenderId: string) => {
+      const lender = lenders.find(item => item.id === lenderId)
+      if (!lender) return null
+      return byKey.get(lenderKey(lender)) ?? Number(lender.opening_balance || 0)
+    }
+  }, [lenders, records, editingId])
+
+  const selectedLender = lenders.find(lender => lender.id === form.lender_id) || null
+
+  // The lender's own name first, because it is the default and the commonest
+  // answer; then everything Other Income has been filed under before.
+  const incomeSourceOptions = useMemo(() => {
+    const names = [selectedLender?.name, ...incomeSources]
+      .map(name => String(name || '').trim())
+      .filter(Boolean)
+    return [...new Set(names)].map(name => ({ value: name, label: name }))
+  }, [selectedLender, incomeSources])
+
+  const balanceBefore = form.lender_id ? balanceBeforeFor(form.lender_id) : null
+  // Paying them moves the balance up toward zero; taking money from them moves
+  // it down. The same arithmetic transactionAmounts does on a saved record.
+  // Profit moves the balance by nothing, the same rule the server applies.
+  const pendingEffect =
+    form.payment_category === 'profit' ? 0
+      : form.transaction_type === 'payment' ? Number(form.amount || 0)
+        : form.transaction_type === 'receive' ? -Number(form.amount || 0)
+          : 0
+  const balanceAfter = balanceBefore === null ? null : balanceBefore + pendingEffect
+
+  function balanceText(amount: number) {
+    const label = loanBalanceLabel(amount)
+    // Nothing owed either way shows the figure, not the word "Balanced" - a
+    // bank/person with no history behind them has a balance of Tk 0, and the
+    // amount is what the reader is looking for in a row labelled "balance".
+    return label === 'Balanced' ? formatCurr(0) : `${label} ${formatCurr(Math.abs(amount))}`
+  }
+
+  function buildPayload() {
+    const lender = lenders.find(l => l.id === form.lender_id)
+    const account = accounts.find(a => a.id === form.account_id)
+    const amount = Number(form.amount || 0)
+    const lenderId = isUuid(form.lender_id) ? form.lender_id : null
+    if (usingFallback) {
+      return {
+        date: form.date,
+        lender_name: lender?.name || '',
+        loan_type: loanTypeFromLender(lender),
+        transaction_type: form.transaction_type,
+        received_amount: form.transaction_type === 'receive' ? amount : 0,
+        payment_amount: form.transaction_type === 'payment' ? amount : 0,
+        account_id: form.account_id || null,
+        account_name: account?.name || '',
+        notes: form.notes,
+        created_by: user?.id,
+      }
+    }
+
+    const ownerId = profile?.owner_id || user?.id
+
+    return {
+      date: form.date,
+      lender_id: lenderId,
+      lender_name: lender?.name || '',
+      loan_type: loanTypeFromLender(lender),
+      transaction_type: form.transaction_type,
+      // The money goes in the same two columns whatever it was for - a profit
+      // payment is still cash leaving the drawer, and the Balance Dashboard
+      // reads these two. The category is what tells the principal apart.
+      payment_category: form.payment_category,
+      // Where the profit lands in the books. Cleared - explicitly, not omitted -
+      // when this stops being a profit payment: an update is a partial payload
+      // and Prisma skips undefined, so an omission would leave a category on a
+      // row that no longer has an expense behind it.
+      ...expenseCategoryFields(form, categories),
+      // The receiving side's label, cleared the same way for the same reason.
+      ...incomeSourceFields(form),
+      received_amount: form.transaction_type === 'receive' ? amount : 0,
+      payment_amount: form.transaction_type === 'payment' ? amount : 0,
+      interest_amount: 0,
+      account_id: form.account_id || null,
+      account_name: account?.name || '',
+      notes: form.notes,
+      owner_id: ownerId,
+      created_by: user?.id,
+    }
+  }
+
+  async function save() {
+    const nextErrors: LoanTransactionValidationErrors = {}
+    if (!form.date) nextErrors.date = REQUIRED_FIELD_MESSAGE
+    if (!form.lender_id) nextErrors.lender_id = REQUIRED_FIELD_MESSAGE
+    if (!form.transaction_type) nextErrors.transaction_type = REQUIRED_FIELD_MESSAGE
+    if (Number(form.amount || 0) <= 0) nextErrors.amount = REQUIRED_FIELD_MESSAGE
+    if (!form.account_id) nextErrors.account_id = REQUIRED_FIELD_MESSAGE
+    if (needsExpenseCategory(form) && !form.expense_category_id) nextErrors.expense_category_id = REQUIRED_FIELD_MESSAGE
+
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length > 0) return
+
+    const payload: any = buildPayload()
+    const { error } = editingId
+      ? await supabase.from('loans').update(payload).eq('id', editingId)
+      : await supabase.from('loans').insert(payload)
+    if (error) return toast.error(error.message)
+
+    toast.success(editingId ? 'Transaction updated' : 'Transaction saved')
+
+    // After that toast, and before resetForm() clears the lender and the
+    // amount: the transaction is on the books whatever the gateway says.
+    await textReceiptToLender(selectedLender, Number(form.amount || 0), balanceAfter)
+
+    resetForm()
+    loadAll()
+  }
+
+  async function textReceiptToLender(lender: any, amount: number, newBalance: number | null) {
+    if (!smsReceipt || amount <= 0 || newBalance === null) return
+
+    const phone = String(lender?.phone || '').trim()
+    if (!isValidBdPhone(phone)) {
+      toast.error('Receipt SMS skipped - this bank/person has no valid phone number')
+      return
+    }
+
+    try {
+      await sendSms({
+        recipients: [phone],
+        message: buildLoanTransactionSms({
+          // The shop's own name, not the software's: this lands on a customer's
+          // phone and they know who they borrowed from.
+          businessName: business?.name_en || business?.name_bn || 'LocalBiz',
+          businessPhone: business?.phone || '',
+          customerName: String(lender?.name || '').trim() || 'Client',
+          amount,
+          // The PRINCIPAL, which a profit entry leaves exactly where it was.
+          // Sending a figure that moved on a profit payment would tell somebody
+          // their debt changed when it did not.
+          principalAfter: newBalance,
+        }),
+      })
+      toast.success('Receipt sent by SMS')
+    } catch (smsError: any) {
+      toast.error(smsFailureMessage(smsError, 'Transaction saved'))
+    }
+  }
+
+  async function deleteRecord(record: any) {
+    if (!(await confirmAction({
+      title: 'Delete Loan Transaction?',
+      message: 'Are you sure you want to delete this loan transaction? Deleting this record will automatically adjust and recalculate the current outstanding balance for the linked Bank/Person and the mapped Cash/Bank account.',
+      confirmText: 'Yes, Delete',
+      cancelText: 'No, Cancel',
+    }))) return
+    const amounts = transactionAmounts(record)
+    addRecycleItem({
+      type: 'loanManagement',
+      table: 'loans',
+      title: loanDisplayName(record) || record.lender_name || '-',
+      subtitle: transactionLabel(amounts.type),
+      amount: amounts.received || amounts.paid,
+      data: record,
+    })
+    const { error } = await supabase.from('loans').delete().eq('id', record.id)
+    if (error) return toast.error(error.message)
+    toast.success('Loan transaction deleted successfully.')
+    loadAll()
+  }
+
+  const filteredRecords = useMemo(() => {
+    return records.filter(record => {
+      if (!inPeriod(String(record.date || ''), period, fromDate, toDate)) return false
+      if (filterLenderName && loanDisplayName(record) !== filterLenderName) return false
+      return true
+    })
+  }, [records, period, fromDate, toDate, filterLenderName])
+
+  // Draws a slice at a time as the reader scrolls. Every row stays in
+  // memory, so totals, filters and exports above are untouched.
+  const shown = useProgressiveRows(filteredRecords, { initial: 40, step: 40 })
+
+  const totalReceived = filteredRecords.reduce((s, r) => s + transactionAmounts(r).received, 0)
+  const totalPaid = filteredRecords.reduce((s, r) => s + transactionAmounts(r).paid, 0)
+  const lenderFilterOptions = useMemo(() => {
+    return Array.from(new Set(records.map(record => loanDisplayName(record)).filter(Boolean))).sort((a, b) => a.localeCompare(b))
+  }, [records])
+  const rangeLabel = `Date range: ${periodLabel(period, fromDate, toDate)}`
+  const lenderLabel = filterLenderName ? `Bank / Person: ${filterLenderName}` : 'Bank / Person: All'
+
+  function clearDateFilter() {
+    setPeriod('all')
+    setFromDate('')
+    setToDate('')
+    setFilterLenderName('')
+  }
+
+  function printTransactions() {
+    if (period === 'custom' && fromDate && toDate && fromDate > toDate) return toast.error('From date cannot be after To date')
+    const printWindow = window.open('', '_blank', 'width=1100,height=760')
+    if (!printWindow) return toast.error('Please allow popups to print')
+
+    const rows = filteredRecords.map((record, index) => {
+      const amounts = transactionAmounts(record)
+      const isPayment = amounts.type === 'payment'
+      return `
+        <tr>
+          <td>${index + 1}</td>
+          <td>${escapeHtml(formatDate(record.date))}</td>
+          <td>${escapeHtml(loanDisplayName(record))}</td>
+          <td class="${isPayment ? 'payment' : 'receive'}">${isPayment ? 'Paid' : 'Received'}</td>
+          <td>${amounts.isProfit ? escapeHtml(`Profit${categoryDetail(record) ? ` - ${categoryDetail(record)}` : ''}`) : 'Principal'}</td>
+          <td>${escapeHtml(record.account_name || '-')}</td>
+          <td class="amount receive">${formatPrintAmount(amounts.received || 0)}</td>
+          <td class="amount payment">${formatPrintAmount(amounts.paid || 0)}</td>
+          <td>${escapeHtml(record.notes || '-')}</td>
+        </tr>
+      `
+    }).join('')
+
+    printWindow.document.write(`
+      <!doctype html>
+      <html>
+        <head>
+          <title>Loan Transactions Print</title>
+          <style>
+            * { box-sizing: border-box; }
+            body { margin: 0; padding: 28px; font-family: Arial, sans-serif; color: #0f172a; }
+            .header { display: flex; justify-content: space-between; gap: 20px; border-bottom: 1px solid #e2e8f0; padding-bottom: 14px; margin-bottom: 16px; }
+            h1 { margin: 0; font-size: 22px; }
+            .muted { color: #64748b; font-size: 12px; margin-top: 5px; }
+            .summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+            .box { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
+            .box-label { color: #64748b; font-size: 12px; }
+            .box-value { margin-top: 5px; font-size: 18px; font-weight: 700; }
+            .receive { color: #059669; }
+            .payment { color: #dc2626; }
+            table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            th { background: #f8fafc; color: #475569; text-align: left; border: 1px solid #e2e8f0; padding: 8px; }
+            td { border: 1px solid #e2e8f0; padding: 7px 8px; vertical-align: top; }
+            .amount { text-align: right; white-space: nowrap; }
+            .empty { text-align: center; color: #94a3b8; padding: 24px; }
+            @media print {
+              body { padding: 18mm; }
+              .no-print { display: none; }
+              tr { break-inside: avoid; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div>
+              <h1>Loan Transactions</h1>
+              <div class="muted">${escapeHtml(rangeLabel)}</div>
+              <div class="muted">${escapeHtml(lenderLabel)}</div>
+            </div>
+            <div class="muted">Generated: ${escapeHtml(formatDate(new Date()))}</div>
+          </div>
+          <div class="summary">
+            <div class="box">
+              <div class="box-label">Total Receive</div>
+              <div class="box-value receive">${formatPrintAmount(totalReceived)}</div>
+            </div>
+            <div class="box">
+              <div class="box-label">Total Payment</div>
+              <div class="box-value payment">${formatPrintAmount(totalPaid)}</div>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Date</th>
+                <th>Bank / Person</th>
+                <th>Type</th>
+                <th>Category</th>
+                <th>Account</th>
+                <th style="text-align:right">Receive</th>
+                <th style="text-align:right">Payment</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows || '<tr><td class="empty" colspan="8">No loan transactions found for this date range.</td></tr>'}
+            </tbody>
+          </table>
+        </body>
+      </html>
+    `)
+    printWindow.document.close()
+    // Asked from here, not from an inline <script> in that window: the
+    // production CSP is script-src 'self' and a window.open('') document
+    // inherits it, so the embedded script never ran and the dialog never
+    // opened. See openPrintDialog.
+    openPrintDialog(printWindow)
+  }
+
+  return (
+    <div className="p-6">
+      <PageHeader title="Loan Transactions" subtitle="Receive and payment records" actions={<button onClick={() => { setErrors({}); setShowModal(true) }} className="btn-primary"><Plus size={16} /> New Transaction</button>} />
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <div className="card"><p className="text-xs text-slate-500">Receive</p><p className="text-xl font-bold text-brand-green mt-1">{formatCurr(totalReceived)}</p></div>
+        <div className="card"><p className="text-xs text-slate-500">Payment</p><p className="text-xl font-bold text-brand-red mt-1">{formatCurr(totalPaid)}</p></div>
+      </div>
+
+      <div className="card overflow-x-auto p-0">
+        <div className="flex flex-col gap-3 border-b border-slate-100 p-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <div className="font-semibold text-slate-800">Transaction List</div>
+            <div className="mt-1 text-xs text-slate-500">{rangeLabel}</div>
+            <div className="mt-1 text-xs text-slate-500">{lenderLabel}</div>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+            <label className="min-w-48">
+              <span className="label">Bank / Person</span>
+              <select className="input h-10" value={filterLenderName} onChange={e => setFilterLenderName(e.target.value)}>
+                <option value="">All Bank / Person</option>
+                {lenderFilterOptions.map(name => <option key={name} value={name}>{name}</option>)}
+              </select>
+            </label>
+            {/* One dropdown rather than two empty date boxes. All Time is the
+                default, which is what somebody opening this page wants to see;
+                the from/to pair only appears under Custom Range. Same control
+                the Transfer, Invest and Profit lists already use. */}
+            <label className="min-w-40">
+              <span className="label">Period</span>
+              <PeriodFilter
+                period={period} setPeriod={setPeriod}
+                from={fromDate} setFrom={setFromDate}
+                to={toDate} setTo={setToDate}
+              />
+            </label>
+            {(period !== 'all' || filterLenderName) && (
+              <button type="button" onClick={clearDateFilter} className="btn-secondary h-10 justify-center px-3" title="Clear filters" aria-label="Clear filters">
+                <X size={16} />
+              </button>
+            )}
+            <button type="button" onClick={printTransactions} className="btn-primary h-10 justify-center">
+              <Printer size={16} /> Print
+            </button>
+          </div>
+        </div>
+        <table className="w-full text-sm">
+          <thead className="table-header">
+            <tr>
+              <th className="text-left py-2 px-4">#</th>
+              <th className="text-left py-2 px-4">Date</th>
+              <th className="text-left py-2 px-4">Bank / Person</th>
+              <th className="text-left py-2 px-4">Type</th>
+              <th className="text-left py-2 px-4">Category</th>
+              <th className="text-left py-2 px-4">Account</th>
+              <th className="text-right py-2 px-4">Receive</th>
+              <th className="text-right py-2 px-4">Payment</th>
+              <th className="text-left py-2 px-4">Notes</th>
+              <th className="text-right py-2 px-4">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {shown.visible.map((record, index) => {
+              const amounts = transactionAmounts(record)
+              const isPayment = amounts.type === 'payment'
+              const typeText = isPayment ? 'Paid' : 'Received'
+              return (
+                <tr key={record.id} className="table-row">
+                  <td className="py-2.5 px-4 text-slate-500">{index + 1}</td>
+                  <td className="py-2.5 px-4">{formatDate(record.date)}</td>
+                  <td className="py-2.5 px-4 font-medium">{loanDisplayName(record)}</td>
+                  <td className={`py-2.5 px-4 font-medium ${isPayment ? 'text-red-600' : 'text-green-600'}`}>{typeText}</td>
+                  {/* Profit is called out, principal is not: the ordinary case
+                      should not shout, and a profit row is the one whose
+                      absence from the running balance needs explaining. */}
+                  <td className="py-2.5 px-4">
+                    {amounts.isProfit
+                      ? <>
+                          <span className="rounded bg-brand-orange-soft px-2 py-0.5 text-xs font-medium text-brand-orange">Profit</span>
+                          {/* Where it landed in Expenses. The question the
+                              owner asks next, answered without a second screen. */}
+                          {categoryDetail(record) && <div className="mt-0.5 text-xs text-slate-400">{categoryDetail(record)}</div>}
+                        </>
+                      : <span className="text-slate-500">Principal</span>}
+                  </td>
+                  <td className="py-2.5 px-4 text-slate-500">{record.account_name || <NoValue />}</td>
+                  <td className="py-2.5 px-4 text-right text-brand-green">{amounts.received ? formatCurr(amounts.received) : <ZeroAmount />}</td>
+                  <td className="py-2.5 px-4 text-right text-brand-red">{amounts.paid ? formatCurr(amounts.paid) : <ZeroAmount />}</td>
+                  <td className="py-2.5 px-4 text-slate-500">{record.notes || <NoValue />}</td>
+                  <td className="py-2.5 px-4">
+                    <div className="flex justify-end gap-2">
+                      <button onClick={() => editRecord(record)} className="text-slate-400 hover:text-slate-700"><Pencil size={15} /></button>
+                      <button onClick={() => deleteRecord(record)} className="text-slate-400 hover:text-brand-red"><Trash2 size={15} /></button>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+            {loading && <TableSkeleton rows={6} cols={9} />}
+            {!loading && filteredRecords.length === 0 && <tr><td colSpan={10} className="text-center py-8 text-slate-400">No loan transactions</td></tr>}
+          {/* Draws the next slice 600px before the reader reaches the end.
+              Every row is already loaded - this only limits how many the
+              browser lays out at once, so no total or filter is affected. */}
+          {shown.hasMore && (
+            <tr ref={shown.sentinelRef as unknown as React.Ref<HTMLTableRowElement>}>
+              <td colSpan={10} className="py-4 text-center text-sm text-slate-400">
+                {shown.visibleCount.toLocaleString()} of {shown.total.toLocaleString()} shown
+              </td>
+            </tr>
+          )}
+          </tbody>
+        </table>
+      </div>
+
+      <Modal isOpen={showModal} onClose={resetForm} title={editingId ? 'Edit Loan Transaction' : 'New Loan Transaction'}>
+        <form className="space-y-3" onSubmit={event => { event.preventDefault(); save() }} noValidate>
+          <div>
+            <label className="label" htmlFor="loan-transactions-f2">{requiredLabel('Date')}</label>
+            <input id="loan-transactions-f2"
+              type="date"
+              className={inputClass('date')}
+              value={form.date}
+              required
+              aria-invalid={!!errors.date}
+              onChange={e => {
+                clearError('date')
+                setForm({ ...form, date: e.target.value })
+              }}
+            />
+            {errors.date && <p className="mt-1 text-xs font-medium text-red-600">{errors.date}</p>}
+          </div>
+          <div>
+            <div className="flex items-center justify-between gap-3">
+              <label className="label">{requiredLabel('Bank / Person')}</label>
+              {/* Text them a receipt for what was just paid or received. */}
+              <label className="mb-1 flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
+                <span>SMS receipt</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={smsReceipt}
+                  onClick={() => setSmsReceipt(prev => {
+                    localStorage.setItem(SMS_RECEIPT_KEY, prev ? '0' : '1')
+                    return !prev
+                  })}
+                  className={`relative h-5 w-9 rounded-full transition-colors ${smsReceipt ? 'bg-brand-green' : 'bg-slate-300'}`}
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${smsReceipt ? 'left-[1.125rem]' : 'left-0.5'}`} />
+                </button>
+              </label>
+            </div>
+            <SearchableSelect
+              value={form.lender_id}
+              onChange={val => {
+                clearError('lender_id')
+                setForm({ ...form, lender_id: val })
+              }}
+              options={lenders.map(lender => ({ value: lender.id, label: lender.name }))}
+              placeholder="Select Bank / Person"
+            />
+            {errors.lender_id && <p className="mt-1 text-xs font-medium text-red-600">{errors.lender_id}</p>}
+          </div>
+
+          {/* Where this account stands, and where the amount being typed leaves
+              it - so nobody has to open the ledger in another tab to find out
+              whether they are clearing a due or creating one. */}
+          {selectedLender && balanceBefore !== null && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-slate-500">Current principal</span>
+                <span className={`font-semibold ${loanBalanceColor(balanceBefore)}`}>{balanceText(balanceBefore)}</span>
+              </div>
+              {pendingEffect !== 0 && balanceAfter !== null && (
+                <div className="mt-1.5 flex items-center justify-between gap-3 border-t border-slate-200 pt-1.5">
+                  <span className="text-slate-500">
+                    After this {form.transaction_type === 'payment' ? 'payment' : 'receive'}
+                  </span>
+                  <span className={`font-semibold ${loanBalanceColor(balanceAfter)}`}>{balanceText(balanceAfter)}</span>
+                </div>
+              )}
+              {/* Said out loud, because an unchanged number is otherwise hard to
+                  tell from a form that has not registered the amount typed. */}
+              {form.payment_category === 'profit' && Number(form.amount || 0) > 0 && (
+                <p className="mt-1.5 border-t border-slate-200 pt-1.5 text-xs text-neutral-500">
+                  Profit does not change what is owed - only the cash account moves.
+                </p>
+              )}
+            </div>
+          )}
+
+          <div>
+            <label className="label">{requiredLabel('Category')}</label>
+            {/* Principal moves what is owed. Profit does not - it is what the
+                money earned, and the debt behind it stays exactly where it was. */}
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                { key: 'principal', label: 'Principal', hint: 'Moves the balance' },
+                { key: 'profit', label: 'Profit', hint: 'Balance unchanged' },
+              ] as const).map(option => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setForm({ ...form, payment_category: option.key })}
+                  className={`rounded-xl border px-3 py-2 text-left transition ${
+                    form.payment_category === option.key
+                      ? 'border-navy-900 bg-navy-900 text-white'
+                      : 'border-neutral-200 bg-white hover:bg-neutral-50'
+                  }`}
+                >
+                  <span className="block text-xs font-semibold">{option.label}</span>
+                  <span className={`mt-0.5 block text-[11px] ${
+                    form.payment_category === option.key ? 'text-white/60' : 'text-neutral-500'
+                  }`}>
+                    {option.hint}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="label">{requiredLabel('Type')}</label>
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                { key: 'receive', label: 'Received', hint: 'Money came in', active: 'border-brand-green bg-brand-green text-white' },
+                { key: 'payment', label: 'Paid', hint: 'Money went out', active: 'border-brand-red bg-brand-red text-white' },
+              ] as const).map(option => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => {
+                    clearError('transaction_type')
+                    setForm({ ...form, transaction_type: option.key })
+                  }}
+                  className={`rounded-xl border px-3 py-2 text-left transition ${
+                    form.transaction_type === option.key
+                      ? option.active
+                      : 'border-neutral-200 bg-white hover:bg-neutral-50'
+                  }`}
+                >
+                  <span className="block text-xs font-semibold">{option.label}</span>
+                  <span className={`mt-0.5 block text-[11px] ${
+                    form.transaction_type === option.key ? 'text-white/70' : 'text-neutral-500'
+                  }`}>
+                    {option.hint}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {errors.transaction_type && <p className="mt-1 text-xs font-medium text-red-600">{errors.transaction_type}</p>}
+          </div>
+
+          {/* Only for profit that was PAID. That money is what borrowing cost,
+              so it is recorded as an expense - and every expense has to say
+              which category. Profit RECEIVED goes to Other Income instead,
+              which has no categories at all: the lender's name is its whole
+              classification, so nothing is asked for on that side.
+
+              Below both toggles because it depends on both of them. */}
+          {needsExpenseCategory(form) && (
+            <div>
+              <label className="label">{requiredLabel('Expense Category')}</label>
+              <SearchableSelect
+                value={form.expense_category_id}
+                onChange={val => {
+                  clearError('expense_category_id')
+                  setForm({ ...form, expense_category_id: val })
+                }}
+                options={categories.map(category => ({ value: category.id, label: category.name }))}
+                placeholder="Select Expense Category"
+              />
+              {errors.expense_category_id && <p className="mt-1 text-xs font-medium text-red-600">{errors.expense_category_id}</p>}
+              <p className="mt-1 text-xs text-neutral-500">
+                Recorded as an expense under this category. The cash account moves once, from this transaction - not twice.
+              </p>
+            </div>
+          )}
+
+          {/* The receiving side. Other Income has no categories, so its source
+              name is the only label it carries - and left to the lender's name
+              alone, a row read six months later says who paid but not what for.
+              Past sources are offered; anything new can be typed. */}
+          {needsIncomeSource(form) && (
+            <div>
+              <label className="label">Income Source</label>
+              <SearchableSelect
+                value={form.income_source_name}
+                onChange={val => setForm({ ...form, income_source_name: val })}
+                options={incomeSourceOptions}
+                allowCustom
+                placeholder={selectedLender?.name || 'Type or pick a source'}
+              />
+              <p className="mt-1 text-xs text-neutral-500">
+                Recorded as Other Income under this name. Left blank, {selectedLender?.name || 'the bank / person'} is used.
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label className="label">{requiredLabel('Account')}</label>
+            <SearchableSelect
+              value={form.account_id}
+              onChange={val => {
+                clearError('account_id')
+                setForm({ ...form, account_id: val })
+              }}
+              options={accounts.map(account => ({ value: account.id, label: account.name }))}
+              placeholder="Select Account"
+            />
+            {errors.account_id && <p className="mt-1 text-xs font-medium text-red-600">{errors.account_id}</p>}
+          </div>
+          <div>
+            <label className="label" htmlFor="loan-transactions-f3">{requiredLabel('Amount')}</label>
+            <input id="loan-transactions-f3"
+              type="number"
+              min="0"
+              className={inputClass('amount')}
+              value={form.amount || ''}
+              required
+              aria-invalid={!!errors.amount}
+              onChange={e => {
+                clearError('amount')
+                setForm({ ...form, amount: Number(e.target.value) })
+              }}
+            />
+            {errors.amount && <p className="mt-1 text-xs font-medium text-red-600">{errors.amount}</p>}
+          </div>
+          <div><label className="label" htmlFor="loan-transactions-f4">Notes</label><textarea id="loan-transactions-f4" className="input" rows={2} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></div>
+          <div className="flex gap-2 pt-2">
+            <button type="submit" className="btn-primary flex-1 justify-center"><Save size={16} /> {editingId ? 'Update' : 'Save'}</button>
+            <button type="button" onClick={resetForm} className="btn-secondary flex-1 justify-center">Cancel</button>
+          </div>
+        </form>
+      </Modal>
+    </div>
+  )
+}

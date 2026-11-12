@@ -1,0 +1,958 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import TableScroller from '../../components/TableScroller'
+import { PencilSimpleIcon as Pencil, PlusIcon as Plus, PrinterIcon as Printer, MagnifyingGlassIcon as Search, TrashIcon as Trash2 } from '@phosphor-icons/react'
+import { useReactToPrint } from 'react-to-print'
+import PageHeader from '../../components/PageHeader'
+import Modal from '../../components/Modal'
+import { confirmAction } from '../../components/ConfirmDialog'
+import { supabase } from '../../lib/supabase'
+import { addPurchaseItem, deletePurchase, deletePurchaseItem } from '../../services/purchase.services'
+import { actualDp, paidOnPurchaseBills, purchaseItemDeposit, spAmountFor } from '../../lib/purchaseAmounts'
+import { firstAmount, formatDate, roundTaka } from '../../lib/utils'
+import { resolveBusinessName } from '../../lib/businessBrand'
+import PeriodFilter from '../../components/PeriodFilter'
+import { inPeriod, type Period } from '../../lib/periodFilter'
+import { useLang } from '../../context/LanguageContext'
+import { useAuth } from '../../context/AuthContext'
+import toast from 'react-hot-toast'
+
+type LedgerInvoice = {
+  id: string
+  si_no: string
+  supplier_id: string
+  supplier_name: string
+  order_date: string
+  invoice_date: string
+  total_bill: number
+  invoice_dp: number
+  quantity: number
+  total_dp_amount: number
+  total: number
+  discount_amount: number
+  special_discount_amount: number
+  actual_deposit_amount: number
+  grand_total: number
+  paid_amount: number
+  due_amount: number
+  items: any[]
+}
+
+type EditablePurchaseItem = {
+  /** Empty on a row added in this session: it has no database row yet. */
+  id: string
+  product_id: string
+  product_code: string
+  product_name: string
+  dp_price: number
+  discount_pct: number
+  actual_dp: number
+  qty: number
+  total_amount: number
+  /** The order's SP percentage the line was priced at; 0 on older lines that carry an amount only. */
+  sp_pct: number
+  sp_amount: number
+  received_qty: number
+}
+
+function latestReceiveDate(purchase: any) {
+  const dates = (purchase.purchase_items || [])
+    .flatMap((item: any) => item.purchase_receives || [])
+    .map((receive: any) => receive.receive_date)
+    .filter(Boolean)
+    .sort((a: string, b: string) => new Date(b).getTime() - new Date(a).getTime())
+
+  return dates[0] || purchase.date
+}
+
+function purchaseTotal(purchase: any) {
+  const itemTotal = (purchase.purchase_items || []).reduce(
+    (sum: number, item: any) => sum + Number(item.total_amount || 0),
+    0
+  )
+  return firstAmount(purchase.net_amount, purchase.total_amount, itemTotal)
+}
+
+function invoiceMetrics(purchase: any) {
+  const items = purchase.purchase_items || []
+  const invoiceDp = items.reduce((sum: number, item: any) => sum + Number(item.dp_price || 0), 0)
+  const quantity = items.reduce((sum: number, item: any) => sum + Number(item.qty || 0), 0)
+  const totalDpAmount = items.reduce((sum: number, item: any) => {
+    const dp = Number(item.dp_price || 0)
+    const qty = Number(item.qty || 0)
+    return sum + (dp * qty)
+  }, 0)
+  const total = items.reduce((sum: number, item: any) => sum + Number(item.total_amount || 0), 0)
+  const discountAmount = items.reduce((sum: number, item: any) => {
+    const dp = Number(item.dp_price || 0)
+    const discountPct = Number(item.discount_pct || 0)
+    const qty = Number(item.qty || 0)
+    return sum + ((dp * discountPct) / 100) * qty
+  }, 0)
+  const specialDiscountAmount = items.reduce((sum: number, item: any) => sum + Number(item.sp_amount || 0), 0)
+  const actualDepositAmount = items.reduce((sum: number, item: any) => sum + purchaseItemDeposit(item), 0)
+
+  return {
+    invoiceDp,
+    quantity,
+    totalDpAmount,
+    total,
+    discountAmount,
+    specialDiscountAmount,
+    actualDepositAmount,
+    // This used to read `purchase.previous_due + actualDepositAmount`. There is
+    // no previous_due column - not in the Prisma model, not in the API - so the
+    // term was always 0 and the list's Grand Total has only ever been the
+    // deposit. Said plainly here rather than left as arithmetic that looks like
+    // it does something.
+    grandTotal: actualDepositAmount,
+  }
+}
+
+export default function PurchaseLedger() {
+  const { t, formatCurr, formatNum } = useLang()
+  const { touchOwnerActivity } = useAuth()
+  const [invoices, setInvoices] = useState<LedgerInvoice[]>([])
+  const [search, setSearch] = useState('')
+  const [supplierFilter, setSupplierFilter] = useState('')
+  const [suppliers, setSuppliers] = useState<any[]>([])
+  // The Sales Ledger's date filter, on the buying side. 'all' by default, so
+  // the page still opens on every invoice.
+  const [period, setPeriod] = useState<Period>('all')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [selectedInvoice, setSelectedInvoice] = useState<LedgerInvoice | null>(null)
+  const [editingInvoice, setEditingInvoice] = useState<LedgerInvoice | null>(null)
+  const [editForm, setEditForm] = useState({ si_no: '', supplier_name: '', date: '' })
+  const [editItems, setEditItems] = useState<EditablePurchaseItem[]>([])
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [products, setProducts] = useState<any[]>([])
+  // Whose voucher this is. A printed page that leaves the shop off is a page
+  // the supplier receiving it cannot file.
+  const [business, setBusiness] = useState<any>(null)
+  const invoiceRef = useRef<HTMLDivElement>(null)
+  const handlePrint = useReactToPrint({ content: () => invoiceRef.current })
+
+  useEffect(() => {
+    loadLedger()
+  }, [])
+
+  // Phone and email on one line, and nothing at all when Settings holds
+  // neither - an empty "Phone:  Email:" is worse than no line.
+  function businessContactLine() {
+    return [
+      business?.phone ? `Phone: ${business.phone}` : '',
+      business?.email ? `Email: ${business.email}` : '',
+    ].filter(Boolean).join('  |  ')
+  }
+
+  async function loadLedger() {
+    try {
+      setLoading(true)
+      const [purchaseRes, paymentRes, productRes, businessRes, supplierRes] = await Promise.all([
+        supabase
+          .from('purchases')
+          .select('*, purchase_items(*, purchase_receives(*))')
+          .in('shipping_status', ['pending', 'partial', 'received'])
+          .order('date', { ascending: false }),
+        supabase
+          // Only what the Paid figure needs: which bill each payment settles,
+          // and how much.
+          .from('supplier_payments')
+          .select('id, purchase_id, purchase_si_no, amount'),
+        supabase
+          .from('products')
+          .select('id, product_code, name, cost_price, dp_discount, discount')
+          .eq('is_active', true),
+        supabase
+          .from('business_settings')
+          .select('name_bn, name_en, phone, email, address, logo_url')
+          .maybeSingle(),
+        // Feeds the Supplier filter. This request was already being made for
+        // the Previous Due ladder and its result thrown away when the ladder was
+        // removed from the voucher - so the filter costs no extra round trip.
+        supabase
+          .from('suppliers')
+          .select('id, name, company_name')
+          .eq('is_active', true)
+          .order('company_name'),
+      ])
+
+      if (purchaseRes.error) throw purchaseRes.error
+      if (paymentRes.error) throw paymentRes.error
+      // Not fatal: without it the filter offers only "All Supplier", and every
+      // invoice still lists.
+      setSuppliers(supplierRes.data || [])
+      // Not fatal either: the voucher still prints, just without a letterhead.
+      setBusiness(businessRes.data || null)
+      // Not fatal: without these the ledger still lists and prints, only the
+      // product picker on a new line comes up empty.
+      setProducts(productRes.data || [])
+
+      const payments = paymentRes.data || []
+      const allPurchases = purchaseRes.data || []
+      const nextInvoices = allPurchases.map((purchase: any) => {
+        const totalBill = purchaseTotal(purchase)
+        const metrics = invoiceMetrics(purchase)
+
+        // Both channels, the same two the Supplier Dashboard adds: what was
+        // settled on the bill when it was entered, plus every payment sent
+        // afterwards. Counting only the payment rows left a bill that was paid
+        // in full at entry showing its whole amount still due here, while the
+        // Supplier Dashboard showed the supplier settled - the two screens
+        // disagreeing by exactly the paid_amount on the bill.
+        const paidLater = payments
+          .filter((payment: any) =>
+            (payment.purchase_id && payment.purchase_id === purchase.id) ||
+            (!payment.purchase_id && payment.purchase_si_no && payment.purchase_si_no === purchase.si_no)
+          )
+          .reduce((sum: number, payment: any) => sum + Number(payment.amount || 0), 0)
+        const paidAmount = paidLater + paidOnPurchaseBills([purchase])
+
+        return {
+          id: purchase.id,
+          si_no: purchase.si_no || '-',
+          supplier_id: purchase.supplier_id || '',
+          supplier_name: purchase.supplier_name || '-',
+          order_date: purchase.date,
+          invoice_date: latestReceiveDate(purchase),
+          total_bill: totalBill,
+          invoice_dp: metrics.invoiceDp,
+          quantity: metrics.quantity,
+          total_dp_amount: metrics.totalDpAmount,
+          total: metrics.total,
+          discount_amount: metrics.discountAmount,
+          special_discount_amount: metrics.specialDiscountAmount,
+          actual_deposit_amount: metrics.actualDepositAmount,
+          grand_total: metrics.grandTotal,
+          paid_amount: paidAmount,
+          due_amount: Math.max(0, totalBill - paidAmount),
+          items: purchase.purchase_items || [],
+        }
+      })
+
+      setInvoices(nextInvoices)
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to load purchase ledger')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  /**
+   * Which invoices belong to the chosen supplier.
+   *
+   * By id where the bill has one. Older bills carry a supplier_name and no
+   * supplier_id at all, and dropping them would make a supplier's own ledger
+   * quietly miss its oldest invoices - so those fall back to matching the name
+   * the dropdown is showing, which is the same string the table prints.
+   */
+  const chosenSupplier = useMemo(
+    () => suppliers.find(row => row.id === supplierFilter),
+    [suppliers, supplierFilter]
+  )
+
+  /**
+   * The day part of a stored date, compared as a string.
+   *
+   * Not new Date(...): a date-only value parses as UTC midnight, so anywhere
+   * west of UTC "2026-10-21" sorts as the 20th. The stored format is already
+   * sortable left to right, which is the whole reason the column is written
+   * that way.
+   */
+  const dayOf = (value: unknown) => String(value || '').slice(0, 10)
+
+  const filteredInvoices = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    const chosenName = chosenSupplier ? (chosenSupplier.company_name || chosenSupplier.name) : ''
+    return invoices.filter(invoice => {
+      if (supplierFilter) {
+        const mine = invoice.supplier_id
+          ? invoice.supplier_id === supplierFilter
+          : Boolean(chosenName) && invoice.supplier_name === chosenName
+        if (!mine) return false
+      }
+      // Filtered on the invoice date, which is the column the table shows and
+      // the one somebody asking "what came in this month" means.
+      if (!inPeriod(String(invoice.invoice_date || invoice.order_date || ''), period, dateFrom, dateTo)) return false
+      if (!q) return true
+      return invoice.si_no.toLowerCase().includes(q) ||
+        invoice.supplier_name.toLowerCase().includes(q)
+    })
+      /**
+       * Newest invoice first, so the list reads as a ledger: oldest at the
+       * bottom, stepping forward in time as the eye travels up.
+       *
+       * Sorted HERE rather than left to the server's order, because the two
+       * are different dates. The query asks for purchases ordered by `date`,
+       * which is the day the order was placed; the column on screen is
+       * Invoice Date, which latestReceiveDate derives from when the goods
+       * actually arrived. A bill ordered in September and received in October
+       * sat among the September rows, so the dates ran 21, 13, 10, 21, 06 and
+       * looked like no order at all.
+       *
+       * Two invoices received the same day fall back to the order date, then
+       * to the invoice number - not for meaning, but so the sort is total and
+       * the rows do not shuffle between renders.
+       */
+      .sort((left, right) => {
+        const byInvoiceDate = dayOf(right.invoice_date).localeCompare(dayOf(left.invoice_date))
+        if (byInvoiceDate !== 0) return byInvoiceDate
+        const byOrderDate = dayOf(right.order_date).localeCompare(dayOf(left.order_date))
+        if (byOrderDate !== 0) return byOrderDate
+        return right.si_no.localeCompare(left.si_no)
+      })
+  }, [invoices, search, period, dateFrom, dateTo, supplierFilter, chosenSupplier])
+
+  /**
+   * What the rows on screen add up to.
+   *
+   * Grand Total, which is the bold column and the figure the owner reads as
+   * "what these invoices came to". Summed over the FILTERED rows, so it always
+   * answers for the supplier and the period currently chosen rather than for
+   * the whole ledger - a total beside a filtered count that counted something
+   * else would be worse than no total.
+   */
+  const filteredTotal = useMemo(
+    () => filteredInvoices.reduce((sum, invoice) => sum + Number(invoice.grand_total || 0), 0),
+    [filteredInvoices],
+  )
+
+  const editTotal = editItems.reduce((sum, item) => sum + Number(item.total_amount || 0), 0)
+  const editDue = Math.max(0, editTotal - Number(editingInvoice?.paid_amount || 0))
+
+  function openEditInvoice(invoice: LedgerInvoice) {
+    setEditingInvoice(invoice)
+    setEditForm({
+      si_no: invoice.si_no,
+      supplier_name: invoice.supplier_name,
+      date: invoice.order_date,
+    })
+    setEditItems(invoice.items.map((item: any) => ({
+      product_id: item.product_id || '',
+      id: item.id,
+      product_code: item.product_code || '',
+      product_name: item.product_name || '',
+      dp_price: Number(item.dp_price || 0),
+      discount_pct: Number(item.discount_pct || 0),
+      actual_dp: Number(item.actual_dp || item.dp_price || 0),
+      qty: Number(item.qty || 0),
+      total_amount: Number(item.total_amount || 0),
+      sp_pct: Number(item.sp_pct || 0),
+      sp_amount: Number(item.sp_amount || 0),
+      received_qty: Number(item.received_qty || 0),
+    })))
+  }
+
+  function closeEditInvoice() {
+    setEditingInvoice(null)
+    setEditItems([])
+    setEditForm({ si_no: '', supplier_name: '', date: '' })
+  }
+
+  async function removeEditItem(index: number) {
+    const item = editItems[index]
+
+    // Never saved, so there is nothing to delete - drop it and say nothing.
+    if (!item.id) {
+      setEditItems(current => current.filter((_, itemIndex) => itemIndex !== index))
+      return
+    }
+
+    if (Number(item.received_qty || 0) > 0) {
+      toast.error('This product is already received and cannot be deleted.')
+      return
+    }
+    if (!(await confirmAction({
+      title: 'Delete this product?',
+      message: 'Are you sure you want to delete this product from the invoice? This cannot be undone.',
+      confirmText: 'Yes, Delete',
+      cancelText: 'Cancel',
+    }))) return
+    try {
+      await deletePurchaseItem(item.id)
+      toast.success('Product deleted')
+      if (editItems.length <= 1) {
+        // Backend removed the whole invoice (it was the last line).
+        closeEditInvoice()
+        await loadLedger()
+      } else {
+        setEditItems(current => current.filter((_, itemIndex) => itemIndex !== index))
+      }
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to delete product')
+    }
+  }
+
+  /**
+   * Delete a whole received purchase invoice.
+   *
+   * The server does the work in one transaction: it takes the received stock
+   * back out of inventory, removes the FIFO batches the goods were costed
+   * from, and files a snapshot in the recycle bin. It REFUSES outright when
+   * any of that stock has already been sold - deleting then would leave the
+   * Inventory page, the Sales page and FIFO each holding a different number.
+   * That refusal arrives as a plain sentence naming how many units, so it is
+   * shown as-is rather than replaced with a generic failure.
+   */
+  async function deleteInvoice(invoice: LedgerInvoice) {
+    if (deletingId) return
+
+    if (!(await confirmAction({
+      title: 'Delete this purchase invoice?',
+      message:
+        `Invoice ${invoice.si_no} from ${invoice.supplier_name} will be moved to the recycle bin. ` +
+        'The stock received against it is taken back out of inventory and the supplier balance is recalculated. ' +
+        'This is refused if any of those goods have already been sold.',
+      confirmText: 'Yes, Delete',
+      cancelText: 'Cancel',
+    }))) return
+
+    try {
+      setDeletingId(invoice.id)
+      await deletePurchase(invoice.id, {
+        type: 'purchases',
+        title: invoice.supplier_name,
+        subtitle: invoice.si_no,
+        amount: invoice.grand_total,
+      })
+      await touchOwnerActivity(true)
+      toast.success('Purchase invoice moved to recycle bin')
+      await loadLedger()
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to delete purchase invoice')
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  /**
+   * Start a new line on this invoice.
+   *
+   * It exists in the form only until Update is pressed - no id, which is what
+   * saveEditedInvoice reads to tell a line that needs creating from one that
+   * needs updating.
+   */
+  function addEditItem() {
+    setEditItems(current => [...current, {
+      id: '',
+      product_id: '',
+      product_code: '',
+      product_name: '',
+      dp_price: 0,
+      discount_pct: 0,
+      actual_dp: 0,
+      qty: 1,
+      total_amount: 0,
+      // A new line takes the order's SP percentage, as its other lines carry it.
+      sp_pct: current.find(item => item.sp_pct > 0)?.sp_pct || 0,
+      sp_amount: 0,
+      received_qty: 0,
+    }])
+  }
+
+  function updateEditItem(index: number, field: keyof EditablePurchaseItem, value: string | number) {
+    setEditItems(current => current.map((item, itemIndex) => {
+      if (itemIndex !== index) return item
+      const next = { ...item, [field]: value }
+
+      // Same auto-fill the Purchase Orders page does: a code that matches a
+      // product brings its name and its rate with it, so a new line does not
+      // have to be typed out by hand - and carries the product_id the server
+      // needs to link the line to real stock.
+      if (field === 'product_code') {
+        const product = products.find(row =>
+          String(row.product_code || '').toLowerCase() === String(value).trim().toLowerCase())
+        if (product) {
+          next.product_id = product.id
+          next.product_name = product.name || ''
+          next.dp_price = Number(product.cost_price || 0)
+          next.discount_pct = Number(product.dp_discount ?? product.discount ?? 0)
+        }
+      }
+
+      const qty = Number(next.qty || 0)
+      // Same shared rule as the Purchase Orders page, so editing an invoice here
+      // cannot produce a different unit price from the one that created it.
+      next.actual_dp = actualDp(next.dp_price, next.discount_pct)
+      next.total_amount = roundTaka(next.actual_dp * qty)
+      // The incentive follows the new total at the line's own percentage, as
+      // the Purchase Orders page works it. It used to keep the old amount
+      // against the new total, so the deposit owed went wrong. A line saved
+      // with an amount and no percentage keeps its amount.
+      if (next.sp_pct > 0) next.sp_amount = spAmountFor(next.total_amount, next.sp_pct)
+      return next
+    }))
+  }
+
+  async function saveEditedInvoice() {
+    if (!editingInvoice) return
+    if (!editForm.si_no.trim() || !editForm.date) {
+      toast.error('Invoice no and date are required')
+      return
+    }
+
+    const invalidItem = editItems.find(item => !item.product_name.trim() || Number(item.qty || 0) < Number(item.received_qty || 0))
+    if (invalidItem) {
+      toast.error('Item name is required and qty cannot be less than received qty')
+      return
+    }
+
+    // A new line has to name a real product: the server links it to stock by
+    // id, and a typed-over code that matches nothing would be rejected there
+    // with a less useful message than this one.
+    const unmatchedItem = editItems.find(item => !item.id && !item.product_id)
+    if (unmatchedItem) {
+      toast.error('Pick a product from the list for every new line - the product code has to match one')
+      return
+    }
+
+    const newItems = editItems.filter(item => !item.id)
+    const existingItems = editItems.filter(item => item.id)
+
+    try {
+      setSavingEdit(true)
+
+      // Lines first, header last. Adding a line makes the server re-total the
+      // purchase from its own rows, so a header written beforehand gets
+      // overwritten by a figure counting only the lines added so far. This way
+      // editTotal is the last word, and the due amount - which the server does
+      // not recompute - survives.
+      for (const item of newItems) {
+        await addPurchaseItem(editingInvoice.id, {
+          product_id: item.product_id,
+          product_code: item.product_code,
+          product_name: item.product_name,
+          dp_price: item.dp_price,
+          discount_pct: item.discount_pct,
+          actual_dp: item.actual_dp,
+          qty: item.qty,
+          total_amount: item.total_amount,
+          sp_pct: item.sp_pct,
+          sp_amount: item.sp_amount,
+        })
+      }
+
+      for (const item of existingItems) {
+        const { error: itemError } = await supabase
+          .from('purchase_items')
+          .update({
+            product_code: item.product_code,
+            product_name: item.product_name,
+            dp_price: item.dp_price,
+            discount_pct: item.discount_pct,
+            actual_dp: item.actual_dp,
+            qty: item.qty,
+            total_amount: item.total_amount,
+            sp_amount: item.sp_amount,
+          })
+          .eq('id', item.id)
+
+        if (itemError) throw itemError
+      }
+
+      // Where the order stands after the edit: changing a quantity does not
+      // move it on the server, so lowering a line to what has arrived used to
+      // leave a fully received order reading Partial, and raising one left it
+      // reading Received.
+      const allIn = editItems.every(item => Number(item.received_qty || 0) >= Number(item.qty || 0))
+      const someIn = editItems.some(item => Number(item.received_qty || 0) > 0)
+
+      const { error: purchaseError } = await supabase
+        .from('purchases')
+        .update({
+          si_no: editForm.si_no.trim(),
+          supplier_name: editForm.supplier_name.trim() || editingInvoice.supplier_name,
+          date: editForm.date,
+          total_amount: editTotal,
+          net_amount: editTotal,
+          due_amount: editDue,
+          shipping_status: allIn ? 'received' : someIn ? 'partial' : 'pending',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', editingInvoice.id)
+
+      if (purchaseError) throw purchaseError
+
+      await touchOwnerActivity(true)
+      toast.success('Purchase invoice updated')
+      closeEditInvoice()
+      await loadLedger()
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to update purchase invoice')
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
+  // The open voucher's account, in the order the Sales invoice states it:
+  // what was owed before this bill, what this bill came to, what has been paid,
+  // and what stands now.
+  //
+  // The paid figure is both channels money reaches a supplier - what was handed
+  // over when the bill was entered plus every payment sent afterwards - which
+  // loadLedger has already added together as paid_amount.
+  //
+  // Every subtraction is off the SAME figure the voucher prints as its Total,
+  // not off total_bill the way the list's Due column does. Otherwise a printed
+  // page could show a Total, a Paid and a Due that do not subtract, which is
+  // the one thing a voucher must never do.
+  const invoiceAmount = roundTaka(selectedInvoice?.actual_deposit_amount)
+  const invoiceDeposit = roundTaka(selectedInvoice?.paid_amount)
+  const invoiceBalance = invoiceAmount - invoiceDeposit
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white p-6">
+      <PageHeader
+        title={t('purchaseLedger_title', 'Purchase Ledger')}
+        subtitle={t('purchaseLedger_subtitle', 'Submitted purchase invoices by supplier')}
+      />
+
+      <div className="mb-4 flex flex-shrink-0 flex-wrap items-center gap-3">
+        <div className="relative min-w-[260px] flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+          <input
+            className="input pl-9"
+            value={search}
+            onChange={event => setSearch(event.target.value)}
+            placeholder="Search supplier or invoice..."
+          />
+        </div>
+        {/* Same classes as the period select beside it, so the two line up.
+            "All Supplier" first, and it is the default - the page is a ledger of
+            everything until somebody narrows it. */}
+        <select
+          className="input h-10 w-auto shrink-0"
+          value={supplierFilter}
+          onChange={event => setSupplierFilter(event.target.value)}
+          title="Filter by supplier"
+        >
+          <option value="">All Supplier</option>
+          {suppliers.map(row => (
+            <option key={row.id} value={row.id}>{row.company_name || row.name}</option>
+          ))}
+        </select>
+        <PeriodFilter
+          period={period} setPeriod={setPeriod}
+          from={dateFrom} setFrom={setDateFrom}
+          to={dateTo} setTo={setDateTo}
+        />
+        <div className="card flex items-center gap-3 px-4 py-2 text-sm text-slate-600">
+          <span>Invoices: <strong className="text-slate-800">{formatNum(filteredInvoices.length)}</strong></span>
+          <span className="h-4 w-px bg-surface-border" />
+          <span>Total: <strong className="tabular-nums text-slate-900">{formatCurr(filteredTotal)}</strong></span>
+        </div>
+      </div>
+
+      <TableScroller wrapClassName="card min-h-0 flex-1 flex flex-col bg-white p-0" className="min-h-0 flex-1 overflow-auto">
+        <table className="w-full min-w-[1120px] text-sm">
+          <thead className="table-header">
+            <tr>
+              <th className="px-4 py-3 text-left">#</th>
+              <th className="px-4 py-3 text-left">Invoice No</th>
+              <th className="px-4 py-3 text-left">Supplier</th>
+              <th className="px-4 py-3 text-left">Invoice Date</th>
+              <th className="px-4 py-3 text-right">Quantity</th>
+              <th className="px-4 py-3 text-right">Total DP Amount</th>
+              <th className="px-4 py-3 text-right">Regular Discount</th>
+              <th className="px-4 py-3 text-right">Special discount</th>
+              <th className="px-4 py-3 text-right">Grand Total</th>
+              <th className="px-4 py-3 text-center">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredInvoices.map((invoice, index) => (
+              <tr key={invoice.id} className="table-row">
+                <td className="px-4 py-3 text-slate-400">{index + 1}</td>
+                <td className="px-4 py-3 font-mono text-xs text-slate-700">{invoice.si_no}</td>
+                <td className="px-4 py-3 font-medium text-slate-800">{invoice.supplier_name}</td>
+                <td className="px-4 py-3">{formatDate(invoice.invoice_date)}</td>
+                <td className="px-4 py-3 text-right font-semibold text-slate-800">{formatNum(invoice.quantity)}</td>
+                <td className="px-4 py-3 text-right font-semibold text-slate-800">{formatCurr(invoice.total_dp_amount)}</td>
+                <td className="px-4 py-3 text-right font-semibold text-brand-red">{formatCurr(invoice.discount_amount)}</td>
+                <td className="px-4 py-3 text-right font-semibold text-brand-red">{formatCurr(invoice.special_discount_amount)}</td>
+                <td className="px-4 py-3 text-right font-bold text-slate-900">{formatCurr(invoice.grand_total)}</td>
+                <td className="px-4 py-3">
+                  <div className="flex items-center justify-center gap-2">
+                    <button
+                      onClick={() => openEditInvoice(invoice)}
+                      className="rounded p-1.5 text-slate-600 hover:bg-slate-100"
+                      title="Edit purchase invoice"
+                    >
+                      <Pencil size={15} />
+                    </button>
+                    <button
+                      onClick={() => setSelectedInvoice(invoice)}
+                      className="rounded p-1.5 text-slate-600 hover:bg-neutral-100"
+                      title="Print invoice"
+                    >
+                      <Printer size={15} />
+                    </button>
+                    <button
+                      onClick={() => deleteInvoice(invoice)}
+                      disabled={deletingId === invoice.id}
+                      className="rounded p-1.5 text-slate-600 transition hover:bg-red-50 hover:text-brand-red disabled:cursor-not-allowed disabled:opacity-40"
+                      title="Delete purchase invoice"
+                      aria-label={`Delete purchase invoice ${invoice.si_no}`}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {!loading && filteredInvoices.length === 0 && (
+              <tr>
+                <td colSpan={10} className="py-10 text-center text-slate-400">
+                  No received purchase invoices found
+                </td>
+              </tr>
+            )}
+            {loading && (
+              <tr>
+                <td colSpan={10} className="py-10 text-center text-slate-400">
+                  Loading purchase ledger...
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </TableScroller>
+
+      <Modal isOpen={!!selectedInvoice} onClose={() => setSelectedInvoice(null)} title="Purchase Invoice / Voucher Details" size="xl">
+        {selectedInvoice && (
+          <>
+            <div ref={invoiceRef} className="invoice-print-page bg-white text-slate-950">
+              <div className="invoice-print-inner">
+                {/* What the page IS, right at the top - the order the Sales
+                    invoice already prints "Invoice Bill" in. */}
+                <h2 className="m-0 text-center text-[20px] font-normal leading-none text-slate-950">Purchase Invoice / Voucher</h2>
+
+                {/* Then the shop, the way a letterhead reads - this page goes
+                    out to a supplier who needs to know who sent it. Same shape
+                    as the Sales invoice, scaled down: this is a voucher, not a
+                    customer-facing bill. */}
+                <div className="relative mb-4 border-b border-slate-400 pb-3">
+                  {business?.logo_url && (
+                    <img
+                      src={business.logo_url}
+                      alt={resolveBusinessName(business)}
+                      className="absolute left-0 top-0 h-14 w-14 object-contain"
+                    />
+                  )}
+                  <div className="mx-auto max-w-[6.8in] text-center">
+                    <h1 className="text-[28px] font-bold leading-tight text-slate-950">
+                      {resolveBusinessName(business)}
+                    </h1>
+                    <div className="mt-1 text-[12px] leading-tight text-slate-700">
+                      {business?.address && <p className="break-words">{business.address}</p>}
+                      {businessContactLine() && <p className="break-words">{businessContactLine()}</p>}
+                    </div>
+                  </div>
+                </div>
+
+                {/* minmax(0,1fr) rather than a plain half-and-half split: a grid
+                    track's default minimum is its content, so a long supplier name
+                    would widen its own column and push the dates off the page
+                    instead of wrapping. Spacing is otherwise unchanged. */}
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-8 border-b border-slate-300 pb-4 text-[12px]">
+                  <div className="min-w-0 space-y-2">
+                    <p className="break-words"><span className="font-bold">Supplier:</span> {selectedInvoice.supplier_name}</p>
+                    <p className="break-words"><span className="font-bold">Invoice No:</span> <span className="font-mono">{selectedInvoice.si_no}</span></p>
+                  </div>
+                  <div className="shrink-0 space-y-2 text-right">
+                    <p className="whitespace-nowrap"><span className="font-bold">Order Date:</span> {formatDate(selectedInvoice.order_date)}</p>
+                    <p className="whitespace-nowrap"><span className="font-bold">Invoice Date:</span> {formatDate(selectedInvoice.invoice_date)}</p>
+                  </div>
+                </div>
+
+                <table className="mt-5 w-full text-[9px] border border-slate-600">
+                  <thead>
+                    <tr className="bg-white">
+                      <th className="border border-slate-600 px-1.5 py-2 text-center w-6">#</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-left">Product Code</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-left">Product</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">DP Amount<br />(৳)</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">Discount %</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">Actual DP</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">Quantity</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">Total</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">SP Amount<br />(৳)</th>
+                      <th className="border border-slate-600 px-1.5 py-2 text-right">Actual Deposit Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedInvoice.items.map((item: any, index: number) => (
+                      <tr key={item.id || index}>
+                        <td className="border border-slate-600 px-1.5 py-2 text-center">{index + 1}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 font-mono">{item.product_code || '-'}</td>
+                        <td className="border border-slate-600 px-1.5 py-2">{item.product_name || '-'}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right">{formatCurr(Number(item.dp_price || 0))}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right">{formatNum(Number(item.discount_pct || 0))}%</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right">{formatCurr(Number(item.actual_dp || item.dp_price || 0))}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right">{formatNum(Number(item.qty || 0))}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right font-semibold">{formatCurr(Number(item.total_amount || 0))}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right">{formatCurr(Number(item.sp_amount || 0))}</td>
+                        <td className="border border-slate-600 px-1.5 py-2 text-right font-semibold">{formatCurr(Math.max(0, Number(item.total_amount || 0) - Number(item.sp_amount || 0)))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                {/* This bill's own arithmetic, at the foot on the right.
+                    Nothing else: the running-account ladder that stood on the
+                    left - previous position, total due, current due - was
+                    removed because the owner reads those figures as wrong, and
+                    a printed voucher is the last place to leave a number the
+                    shop does not trust. supplierPositionBefore still exists,
+                    tested, in lib/purchaseAmounts.ts, so the ladder can come
+                    back the day the right basis is settled. */}
+                <div className="mt-4 flex justify-end text-[11px] leading-tight">
+                  <div className="w-full max-w-[3in] space-y-1.5">
+                    <div className="flex justify-between"><span>Subtotal</span><span>{formatCurr(selectedInvoice.total_dp_amount)}</span></div>
+                    <div className="flex justify-between"><span>(-) Discount</span><span>{formatCurr(selectedInvoice.discount_amount)}</span></div>
+                    <div className="flex justify-between"><span>(-) SP Discount</span><span>{formatCurr(selectedInvoice.special_discount_amount)}</span></div>
+                    <div className="border-t border-slate-400 pt-1.5 flex justify-between font-bold text-[13px]"><span>Total</span><span>{formatCurr(invoiceAmount)}</span></div>
+                    <div className="flex justify-between"><span>Paid</span><span>{formatCurr(invoiceDeposit)}</span></div>
+                    <div className="border-t border-slate-400 pt-1.5 flex justify-between font-semibold"><span>Due</span><span>{formatCurr(invoiceBalance)}</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <button onClick={handlePrint} className="btn-primary mt-4 w-full justify-center">
+              <Printer size={16} /> Print Invoice
+            </button>
+          </>
+        )}
+      </Modal>
+
+      <Modal isOpen={!!editingInvoice} onClose={closeEditInvoice} title="Edit Purchase Invoice / Voucher" size="xl">
+        {editingInvoice && (
+          <div className="space-y-5">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <label>
+                <span className="label">Supplier Name</span>
+                <input
+                  className="input"
+                  value={editForm.supplier_name}
+                  onChange={event => setEditForm({ ...editForm, supplier_name: event.target.value })}
+                />
+              </label>
+              <label>
+                <span className="label">Invoice No</span>
+                <input
+                  className="input font-mono"
+                  value={editForm.si_no}
+                  onChange={event => setEditForm({ ...editForm, si_no: event.target.value })}
+                />
+              </label>
+              <label>
+                <span className="label">Date</span>
+                <input
+                  type="date"
+                  className="input"
+                  value={editForm.date}
+                  onChange={event => setEditForm({ ...editForm, date: event.target.value })}
+                />
+              </label>
+            </div>
+
+            <div className="overflow-x-auto rounded-lg border border-slate-100">
+              <table className="w-full min-w-[980px] text-xs">
+                <thead className="bg-white text-[11px] font-bold uppercase text-slate-600">
+                  <tr>
+                    <th className="px-3 py-3 text-left">#</th>
+                    <th className="px-3 py-3 text-left">Product Code</th>
+                    <th className="px-3 py-3 text-left">Item Name</th>
+                    <th className="px-3 py-3 text-right">Qty</th>
+                    <th className="px-3 py-3 text-right">Received</th>
+                    <th className="px-3 py-3 text-right">Price</th>
+                    <th className="px-3 py-3 text-right">Discount %</th>
+                    <th className="px-3 py-3 text-right">Actual Price</th>
+                    <th className="px-3 py-3 text-right">Total Bill</th>
+                    <th className="px-3 py-3 text-center">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {editItems.map((item, index) => (
+                    <tr key={item.id || `new-${index}`} className="border-t border-slate-100 bg-white">
+                      <td className="px-3 py-3 font-semibold text-slate-500">{index + 1}</td>
+                      <td className="px-3 py-3">
+                        <input className="input h-10 w-28 text-xs font-mono" list="purchase-ledger-product-codes" value={item.product_code} onChange={event => updateEditItem(index, 'product_code', event.target.value)} />
+                      </td>
+                      <td className="px-3 py-3">
+                        <input className="input h-10 min-w-[220px] text-xs" value={item.product_name} onChange={event => updateEditItem(index, 'product_name', event.target.value)} />
+                      </td>
+                      <td className="px-3 py-3">
+                        <input type="number" min={item.received_qty} className="input h-10 w-20 text-right text-xs" value={item.qty || ''} onChange={event => updateEditItem(index, 'qty', Number(event.target.value))} />
+                      </td>
+                      <td className="px-3 py-3 text-right font-semibold text-brand-green">{formatNum(item.received_qty)}</td>
+                      <td className="px-3 py-3">
+                        <input type="number" min="0" className="input h-10 w-24 text-right text-xs" value={item.dp_price || ''} onChange={event => updateEditItem(index, 'dp_price', Number(event.target.value))} />
+                      </td>
+                      <td className="px-3 py-3">
+                        <input type="number" min="0" max="100" className="input h-10 w-20 text-right text-xs" value={item.discount_pct || ''} onChange={event => updateEditItem(index, 'discount_pct', Number(event.target.value))} />
+                      </td>
+                      <td className="px-3 py-3 text-right font-semibold text-slate-800">{formatCurr(item.actual_dp)}</td>
+                      <td className="px-3 py-3 text-right font-bold text-slate-800">{formatCurr(item.total_amount)}</td>
+                      <td className="px-3 py-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => removeEditItem(index)}
+                          disabled={Number(item.received_qty || 0) > 0}
+                          title={Number(item.received_qty || 0) > 0 ? 'Received items cannot be deleted' : 'Delete product'}
+                          className="rounded-lg bg-red-50 p-1.5 text-red-500 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* One list for every row's code box, rather than a copy per row. */}
+            <datalist id="purchase-ledger-product-codes">
+              {products.map(product => (
+                <option key={product.id} value={product.product_code || ''}>{product.name}</option>
+              ))}
+            </datalist>
+
+            <div className="flex items-center justify-between gap-3">
+              <button type="button" onClick={addEditItem} className="btn-secondary text-xs">
+                <Plus size={14} /> Add Product
+              </button>
+              <p className="text-xs text-slate-500">
+                Pick a product code from the list - the name and rate fill in from it.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div className="card bg-white shadow-none">
+                <p className="text-xs text-slate-500">Total Bill</p>
+                <p className="mt-1 text-xl font-bold text-slate-800">{formatCurr(editTotal)}</p>
+              </div>
+              <div className="card bg-white shadow-none">
+                <p className="text-xs text-slate-500">Paid Amount</p>
+                <p className="mt-1 text-xl font-bold text-brand-green">{formatCurr(editingInvoice.paid_amount)}</p>
+              </div>
+              <div className="card bg-white shadow-none">
+                <p className="text-xs text-slate-500">Due Amount</p>
+                <p className="mt-1 text-xl font-bold text-brand-red">{formatCurr(editDue)}</p>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button onClick={closeEditInvoice} className="btn-secondary">Cancel</button>
+              <button onClick={saveEditedInvoice} disabled={savingEdit} className="btn-primary">
+                {savingEdit ? 'Updating...' : 'Update Purchase Invoice'}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  )
+}

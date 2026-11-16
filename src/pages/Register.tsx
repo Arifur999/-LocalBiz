@@ -145,7 +145,7 @@ export default function Register() {
 
   return (
     <AuthShell
-      image="/auth-register.jpg"
+      image="/auth-register.svg"
       imageAlt={businessName}
       brandName={businessName}
       heading={copy.heading}

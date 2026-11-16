@@ -4,7 +4,7 @@ import { GlobeIcon as Globe } from '@phosphor-icons/react'
 import { Lang } from '../context/LanguageContext'
 
 interface AuthShellProps {
-  /** Public image URL for the left brand panel (e.g. "/auth-login.jpg"). */
+  /** Public image URL for the left brand panel (e.g. "/auth-login.svg"). */
   image: string
   imageAlt: string
   brandName: string
@@ -39,7 +39,7 @@ export default function AuthShell({ image, imageAlt, brandName, heading, subtitl
           />
           <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/30 to-black/40" />
           <div className="relative z-10 flex h-full flex-col justify-between p-10 text-white">
-            <img src="/logo-light.png" alt={brandName} className="h-8 w-auto self-start object-contain" />
+            <img src="/logo-light.svg" alt={brandName} className="h-8 w-auto self-start object-contain" />
             <div>
               <h1 className="text-3xl font-black leading-tight xl:text-[34px]">{heading}</h1>
               <p className="mt-3 max-w-md text-sm leading-relaxed text-white/75">{subtitle}</p>

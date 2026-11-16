@@ -354,7 +354,7 @@ export default function Layout() {
             // The light mark, because the sidebar shares the dark frame. It is
             // hidden when collapsed - the sidebar is 64px there and a wordmark
             // this wide would only squash.
-            <img src="/logo-light.png" alt={t('appName')} className="h-7 w-auto object-contain" />
+            <img src="/logo-light.svg" alt={t('appName')} className="h-7 w-auto object-contain" />
           )}
           <button
             onClick={() => setCollapsed(!collapsed)}

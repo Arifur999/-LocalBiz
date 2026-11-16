@@ -74,7 +74,7 @@ export default function Login() {
 
   return (
     <AuthShell
-      image="/auth-login.jpg"
+      image="/auth-login.svg"
       imageAlt={businessName}
       brandName={businessName}
       heading={copy.heading}

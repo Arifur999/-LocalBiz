@@ -336,7 +336,7 @@ export default function SubscriptionPlans() {
         title={hasWorkspaceAccess ? copy('goDashboard') : undefined}
         className="fixed left-6 top-6 z-20 rounded-lg p-1 transition hover:opacity-80 lg:left-36 lg:top-16"
       >
-        <img src="/logo-dark.png" alt={t('appName')} className="h-8 w-auto object-contain" />
+        <img src="/logo-dark.svg" alt={t('appName')} className="h-8 w-auto object-contain" />
       </button>
 
       {/* Mirrors the logo opposite it, rather than sitting in the corner on

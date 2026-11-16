@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 48" role="img" aria-label="LocalBiz">
+  <rect width="48" height="48" rx="12" fill="#0F1117"/>
+  <path d="M11 19 L13.5 12 H34.5 L37 19 a3.25 3.25 0 0 1 -6.5 0 a3.25 3.25 0 0 1 -6.5 0 a3.25 3.25 0 0 1 -6.5 0 a3.25 3.25 0 0 1 -6.5 0 Z M13 23 H35 V36 H13 Z M21 28 H27 V36 H21 Z" fill="#FFFFFF" fill-rule="evenodd"/>
+  <text x="58" y="34" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="27" font-weight="800" letter-spacing="-0.6" fill="#0F1117">Local<tspan fill="#16A34A">Biz</tspan></text>
+</svg>

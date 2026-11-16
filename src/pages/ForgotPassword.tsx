@@ -90,7 +90,7 @@ export default function ForgotPassword() {
 
   return (
     <AuthShell
-      image="/auth-login.jpg"
+      image="/auth-login.svg"
       imageAlt={businessName}
       brandName={businessName}
       heading={t.heading}

@@ -14,7 +14,9 @@ const copy = {
     emailTitle: 'Forgot password',
     emailHint: "Enter your account email — we'll email you a reset code.",
     resetTitle: 'Set a new password',
-    resetHint: 'Enter the 6-digit code we emailed you and your new password.',
+    // The server no longer says whether an email is registered (that let
+    // anyone test addresses), so this is where a mistyped one gets noticed.
+    resetHint: 'Enter the 6-digit code we emailed you and your new password. No email after a minute? Check that it is the address you signed up with.',
     email: 'Email address',
     code: 'Reset code',
     newPass: 'New password',
@@ -30,7 +32,7 @@ const copy = {
     emailTitle: 'পাসওয়ার্ড ভুলে গেছেন',
     emailHint: 'আপনার অ্যাকাউন্টের ইমেইল দিন — রিসেট কোড পাঠানো হবে।',
     resetTitle: 'নতুন পাসওয়ার্ড দিন',
-    resetHint: 'ইমেইলে পাঠানো ৬-সংখ্যার কোড ও নতুন পাসওয়ার্ড দিন।',
+    resetHint: 'ইমেইলে পাঠানো ৬-সংখ্যার কোড ও নতুন পাসওয়ার্ড দিন। এক মিনিটেও ইমেইল না এলে দেখুন এটি আপনার রেজিস্টার করা ইমেইল কিনা।',
     email: 'ইমেইল ঠিকানা',
     code: 'রিসেট কোড',
     newPass: 'নতুন পাসওয়ার্ড',

@@ -12,6 +12,7 @@ import toast from 'react-hot-toast'
 import { NoValue } from '../components/CellValue'
 import Modal from '../components/Modal'
 import { amountClass, formatDate } from '../lib/utils'
+import { downloadCsv } from '../lib/spreadsheet'
 
 type InventoryRow = {
   id: string; product_id: string; available_qty: number; upcoming_qty: number; dp_price: number | null
@@ -330,13 +331,12 @@ export default function Inventory() {
       const dp = Number(r.fifo_average_dp || 0)
       const sup = r.products?.suppliers?.company_name || r.products?.suppliers?.name || ''
       const status = t(statusConfig[getStatus(r)].labelKey)
-      return [r.products?.product_code || '', r.products?.name || '', sup, r.opening_qty, r.order_qty, r.received_qty, r.upcoming_qty, r.available_qty, dp, r.fifo_stock_value || 0, status].map(v => `"${v}"`).join(',')
+      return [r.products?.product_code || '', r.products?.name || '', sup, r.opening_qty, r.order_qty, r.received_qty, r.upcoming_qty, r.available_qty, dp, r.fifo_stock_value || 0, status]
     })
-    const csv = [headers.join(','), ...csvRows].join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a'); a.href = url; a.download = `inventory_${new Date().toISOString().slice(0,10)}.csv`; a.click()
-    URL.revokeObjectURL(url)
+    // Through the shared writer rather than quoting cells by hand: it doubles
+    // the quotes inside a name (a 6" shelf used to break the row here) and
+    // stops a name that starts with = + - @ being run as a formula in Excel.
+    downloadCsv(`inventory_${new Date().toISOString().slice(0,10)}.csv`, [headers, ...csvRows])
   }
 
   // Same columns and rows as the CSV, rendered through the shared print sheet.

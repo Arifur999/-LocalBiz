@@ -166,8 +166,30 @@ export function resolveDiscountColumns(headers: string[]) {
   return { dp, mrp }
 }
 
-function csvEscape(value: any) {
-  return `"${String(value ?? '').replace(/"/g, '""')}"`
+/**
+ * Text for a CSV cell that a spreadsheet will not run as a formula.
+ *
+ * Excel, LibreOffice and Google Sheets all treat a cell that begins with
+ * = + - or @ as a formula, quoted or not. A product or customer name is typed
+ * by staff or arrives in an imported file, so `=HYPERLINK("http://...","Pay")`
+ * as a name would become a live link in the owner's export. A leading
+ * apostrophe is the standard way to say "this is text"; the spreadsheet hides
+ * it and shows the value as typed.
+ *
+ * Numbers are left alone, including text that only looks like one: -500 and
+ * +8801719731884 are an amount and a phone number, cannot carry a formula, and
+ * must survive a round trip back through an import unchanged.
+ */
+export function csvSafeText(value: unknown): string {
+  const text = String(value ?? '')
+  if (typeof value === 'number') return text
+  if (!/^[=+\-@\t\r]/.test(text)) return text
+  if (/^[+-][\d\s.,]+%?$/.test(text)) return text
+  return `'${text}`
+}
+
+export function csvEscape(value: unknown) {
+  return `"${csvSafeText(value).replace(/"/g, '""')}"`
 }
 
 export function downloadCsv(filename: string, rows: any[][]) {
